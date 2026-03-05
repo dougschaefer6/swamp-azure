@@ -1,0 +1,27 @@
+manifestVersion: 1
+name: "@dougschaefer/azure"
+version: "2026.03.05.1"
+description: "Azure infrastructure management — resource groups, networking (VNets, subnets, peering, NSGs, route tables, public IPs, NAT gateways, Azure Firewall), compute (VMs with full lifecycle), data (Azure SQL, storage accounts), security (Key Vault), and topology visualization (Mermaid diagrams). All operations via Azure CLI."
+repository: https://github.com/dougschaefer6/swamp-azure
+labels:
+  - azure
+  - cloud
+  - infrastructure
+  - networking
+  - compute
+  - security
+  - database
+  - storage
+models:
+  - azure/resource_group.ts
+  - azure/nsg.ts
+  - azure/route_table.ts
+  - azure/public_ip.ts
+  - azure/nat_gateway.ts
+  - azure/firewall.ts
+  - azure/vnet.ts
+  - azure/vm.ts
+  - azure/storage_account.ts
+  - azure/key_vault.ts
+  - azure/sql.ts
+  - azure/topology.ts
