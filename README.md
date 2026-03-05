@@ -2,7 +2,7 @@
 
 Azure infrastructure management extension for [Swamp](https://swamp.club) — the AI-native automation CLI.
 
-Provides 12 model types covering Azure resource groups, networking, compute, data services, security, and topology visualization. All operations use the Azure CLI (`az`), so authentication is handled by whatever `az login` session exists on the machine running Swamp.
+Provides 13 model types covering Azure resource groups, networking (including vWAN), compute, data services, security, and topology visualization. All operations use the Azure CLI (`az`), so authentication is handled by whatever `az login` session exists on the machine running Swamp.
 
 ## Installation
 
@@ -28,6 +28,7 @@ swamp extension pull @dougschaefer/azure
 | Public IP | `@dougschaefer/azure-public-ip` | Public IP addresses (Standard/Basic, Static/Dynamic) |
 | NAT Gateway | `@dougschaefer/azure-nat-gateway` | NAT gateways for outbound connectivity |
 | Azure Firewall | `@dougschaefer/azure-firewall` | Azure Firewall instances and firewall policies |
+| vWAN | `@dougschaefer/azure-vwan` | Virtual WANs, virtual hubs, hub connections, VPN sites, and VPN gateways |
 
 ### Compute
 
@@ -128,6 +129,10 @@ Exports the full ARM template for a resource group, stored as versioned data in 
 ### Azure Firewall Methods (7)
 
 `list` · `get` · `create` · `delete` · `listPolicies` · `getPolicy` · `createPolicy`
+
+### vWAN Methods (18)
+
+`listVwans` · `getVwan` · `createVwan` · `deleteVwan` · `listHubs` · `getHub` · `createHub` · `deleteHub` · `listHubConnections` · `createHubConnection` · `deleteHubConnection` · `listVpnSites` · `getVpnSite` · `createVpnSite` · `deleteVpnSite` · `listVpnGateways` · `getVpnGateway` · `inventory`
 
 ### Azure SQL Methods (7)
 
