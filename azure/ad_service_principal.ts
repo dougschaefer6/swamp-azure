@@ -1,5 +1,10 @@
 import { z } from "npm:zod@4.3.6";
-import { az, EntraGlobalArgsSchema, sanitizeInstanceName } from "./_helpers.ts";
+import {
+  az,
+  EntraGlobalArgsSchema,
+  graphRequest,
+  sanitizeInstanceName,
+} from "./_helpers.ts";
 
 const ServicePrincipalSchema = z
   .object({
@@ -35,6 +40,32 @@ const OwnerSchema = z
   })
   .passthrough();
 
+const AppRoleAssignmentSchema = z
+  .object({
+    id: z.string(),
+    appRoleId: z.string().nullish(),
+    principalId: z.string(),
+    principalDisplayName: z.string().nullish(),
+    principalType: z.string().nullish(),
+    resourceDisplayName: z.string().nullish(),
+  })
+  .passthrough();
+
+const SynchronizationJobSchema = z
+  .object({
+    id: z.string(),
+    templateId: z.string().nullish(),
+    schedule: z.object({ state: z.string().nullish() }).passthrough().nullish(),
+    status: z
+      .object({
+        code: z.string().nullish(),
+        lastSuccessfulExecution: z.unknown().nullish(),
+      })
+      .passthrough()
+      .nullish(),
+  })
+  .passthrough();
+
 /**
  * `@dougschaefer/azure-ad-service-principal` model — Entra ID service
  * principal reads and credential auditing, wrapping the `az ad sp`
@@ -46,9 +77,14 @@ const OwnerSchema = z
  * SP by appId or object id, listCredentials surfaces password and
  * certificate credential metadata (including `endDateTime` for
  * expiry auditing — secret values are never returned by Graph), and
- * listOwners resolves who controls the SP. Creation is intentionally
- * out of scope because `create-for-rbac` emits secret material that
- * should not flow through stored model data.
+ * listOwners resolves who controls the SP. listAppRoleAssignments and
+ * listSynchronizationJobs call Microsoft Graph directly via
+ * {@link graphRequest} because the `az ad sp` CLI has no equivalent
+ * subcommands: the former resolves which users/groups actually hold
+ * access (the source of truth behind a SAML app's role assignments),
+ * the latter surfaces SCIM provisioning job status for an enterprise
+ * app. Creation is intentionally out of scope because `create-for-rbac`
+ * emits secret material that should not flow through stored model data.
  */
 export const model = {
   type: "@dougschaefer/azure-ad-service-principal",
@@ -70,6 +106,20 @@ export const model = {
     owner: {
       description: "Owner of a service principal",
       schema: OwnerSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    appRoleAssignment: {
+      description:
+        "Principal (user or group) assigned an app role on a service principal",
+      schema: AppRoleAssignmentSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    synchronizationJob: {
+      description:
+        "SCIM provisioning synchronization job on a service principal",
+      schema: SynchronizationJobSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -227,6 +277,86 @@ export const model = {
             "owner",
             sanitizeInstanceName(o.id as string),
             o,
+          );
+          handles.push(handle);
+        }
+        return { dataHandles: handles };
+      },
+    },
+
+    listAppRoleAssignments: {
+      description:
+        "List principals (users/groups) assigned an app role on this service principal — the source of truth for who actually has access.",
+      arguments: z.object({
+        id: z.string().describe("Service principal object id"),
+      }),
+      execute: async (args, context) => {
+        const { status, data } = await graphRequest(
+          "GET",
+          `/servicePrincipals/${args.id}/appRoleAssignedTo`,
+        );
+        if (status !== 200) {
+          throw new Error(
+            `Graph list appRoleAssignedTo failed for ${args.id} (HTTP ${status})`,
+          );
+        }
+
+        const assignments =
+          ((data as { value?: Array<Record<string, unknown>> })?.value) ?? [];
+
+        context.logger.info("SP {id} has {count} app role assignments", {
+          id: args.id,
+          count: assignments.length,
+        });
+
+        const handles = [];
+        for (const a of assignments) {
+          const handle = await context.writeResource(
+            "appRoleAssignment",
+            sanitizeInstanceName(a.id as string),
+            a,
+          );
+          handles.push(handle);
+        }
+        return { dataHandles: handles };
+      },
+    },
+
+    listSynchronizationJobs: {
+      description:
+        "List SCIM provisioning synchronization jobs configured on this service principal.",
+      arguments: z.object({
+        id: z.string().describe("Service principal object id"),
+      }),
+      execute: async (args, context) => {
+        const { status, data } = await graphRequest(
+          "GET",
+          `/servicePrincipals/${args.id}/synchronization/jobs`,
+        );
+        if (status !== 200 && status !== 404) {
+          throw new Error(
+            `Graph list synchronization jobs failed for ${args.id} (HTTP ${status})`,
+          );
+        }
+
+        // A 404 means the SP has no synchronization template provisioned —
+        // treat that as zero jobs rather than an error.
+        const jobs = status === 404
+          ? []
+          : ((data as { value?: Array<Record<string, unknown>> })?.value) ??
+            [];
+
+        context.logger.info("SP {id} has {count} synchronization jobs", {
+          id: args.id,
+          count: jobs.length,
+        });
+
+        const handles = [];
+        for (const j of jobs) {
+          const handle = await context.writeResource(
+            "synchronizationJob",
+            sanitizeInstanceName(j.id as string),
+            j,
           );
           handles.push(handle);
         }

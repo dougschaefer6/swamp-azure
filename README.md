@@ -314,6 +314,8 @@ Tenant-scoped (Entra ID). Read-only — `create-for-rbac` is excluded because it
 | `sync` | Refresh stored state without making changes |
 | `listCredentials` | List password/certificate credential metadata for expiry auditing |
 | `listOwners` | List the owners of a service principal |
+| `listAppRoleAssignments` | List principals (users/groups) assigned an app role — the source of truth for who actually has access |
+| `listSynchronizationJobs` | List SCIM provisioning synchronization jobs configured on the service principal |
 
 ### azure-ad-app-registration
 
