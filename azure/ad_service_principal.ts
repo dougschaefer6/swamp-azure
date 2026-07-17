@@ -291,18 +291,32 @@ export const model = {
         id: z.string().describe("Service principal object id"),
       }),
       execute: async (args, context) => {
-        const { status, data } = await graphRequest(
-          "GET",
-          `/servicePrincipals/${args.id}/appRoleAssignedTo`,
-        );
-        if (status !== 200) {
-          throw new Error(
-            `Graph list appRoleAssignedTo failed for ${args.id} (HTTP ${status})`,
-          );
-        }
+        const assignments: Array<Record<string, unknown>> = [];
+        let path: string | null =
+          `/servicePrincipals/${args.id}/appRoleAssignedTo`;
 
-        const assignments =
-          ((data as { value?: Array<Record<string, unknown>> })?.value) ?? [];
+        while (path) {
+          const { status, data } = await graphRequest("GET", path);
+          if (status !== 200) {
+            throw new Error(
+              `Graph list appRoleAssignedTo failed for ${args.id} (HTTP ${status})`,
+            );
+          }
+
+          const page = data as {
+            value?: Array<Record<string, unknown>>;
+            "@odata.nextLink"?: string;
+          };
+          assignments.push(...(page?.value ?? []));
+
+          // appRoleAssignedTo pages at 100 via @odata.nextLink; graphRequest
+          // prefixes the Graph v1.0 base URL, so strip it back off before
+          // following the link — otherwise the base URL doubles up.
+          const nextLink = page?.["@odata.nextLink"];
+          path = nextLink
+            ? nextLink.replace("https://graph.microsoft.com/v1.0", "")
+            : null;
+        }
 
         context.logger.info("SP {id} has {count} app role assignments", {
           id: args.id,
