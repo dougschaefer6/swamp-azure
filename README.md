@@ -54,6 +54,7 @@ Most models include a `sync` method that refreshes stored state without making c
 | `azure-recovery-services-vault` | Recovery Services vaults and their backup items (read-only) |
 | `azure-log-analytics-workspace` | Log Analytics workspace inventory (read-only) |
 | `azure-network-interface` | Network interface inventory (read-only) |
+| `azure-cost` | Actual billed spend and cost optimization — Cost Management queries, VM utilization evidence, network-spend auditing, orphan sweeps, and Advisor/reservation recommendations (read-only) |
 
 ## Method Reference
 
@@ -454,7 +455,10 @@ The vWAN model manages the full hub-and-spoke topology as a set of interdependen
 | `deleteVpnSite` | Delete a VPN site |
 | `listVpnGateways` | List VPN gateways in a resource group |
 | `getVpnGateway` | Get a VPN gateway by name |
+| `setVpnGatewayScaleUnit` | Set the scale unit count on an S2S VPN gateway (idempotent) |
 | `inventory` | Full inventory of all vWAN resources (WANs, hubs, connections, sites, gateways) |
+
+`setVpnGatewayScaleUnit` is the primary cost lever on a vWAN S2S gateway: each scale unit is 500 Mbps of aggregate tunnel throughput and bills hourly whether or not the tunnels carry traffic. Size it against observed peak throughput rather than tunnel count. Re-provisioning briefly drops every tunnel on the gateway, so treat it as a maintenance-window change.
 
 ### azure-resource-group
 
@@ -616,6 +620,26 @@ Read-only NIC inventory — the join point between VMs, subnets, NSGs, and IPs t
 | `get` | Get a NIC (IP configurations, attached VM, NSG, DNS settings) |
 | `sync` | Refresh stored state without making changes |
 
+### azure-cost
+
+Actual billed spend, and the evidence needed to act on it. This is the counterpart to `azure-topology`'s `costEstimate`, which projects forward from resource config and Retail Pricing — `azure-cost` reports what was really billed and why. Every method is read-only.
+
+| Method | Description |
+|---|---|
+| `queryCosts` | Billed cost from Cost Management, sliced by service, resource, meter, resource type, or resource group |
+| `vmUtilization` | Per-VM CPU and network utilization over a window, with an idle/oversized verdict |
+| `auditNetworkSpend` | Whether network plumbing earns its price — firewall in the data path, shadowed rules, gateway scale units vs. throughput, tunnels with no traffic |
+| `findOrphans` | Unattached disks, unassociated public IPs, ownerless NICs, and stale snapshots via Resource Graph |
+| `advisorCostRecommendations` | Azure Advisor cost recommendations and Consumption reservation recommendations |
+
+Three things worth knowing before acting on the output:
+
+**Group by `Meter`, not just `ServiceName`.** A service-level rollup hides the changes that matter. An added VPN scale unit, a new per-branch connection unit, or a firewall tier change all appear at meter level as a changed hour count against a specific meter, while the service total just drifts upward without explanation.
+
+**Advisor is evidence, not instruction.** It reads idle CPU without knowing workload intent. A capacity-sized appliance — a conferencing node, a media transcoder — looks idle by design and must be judged on traffic counters and its vendor's core-count floor, not CPU percentage. Downsizing one to the SKU Advisor suggests can leave it unable to do its job at all. Equally, settle right-sizing *before* buying any reservation: a reservation bought against a SKU you are about to change is wasted money.
+
+**Liveness is judged from time-series metrics, not counters.** `auditNetworkSpend` measures tunnel traffic from Azure Monitor rather than the cumulative `ingressBytesTransferred`/`egressBytesTransferred` fields on the gateway resource. Those counters reset when a gateway is re-provisioned, so immediately after any scale-unit change a busy tunnel reads as zero — enough to make an audit recommend deleting connections that are carrying production traffic.
+
 ## Workflows
 
 | Workflow | Description |
@@ -623,6 +647,7 @@ Read-only NIC inventory — the join point between VMs, subnets, NSGs, and IPs t
 | `@dougschaefer/provision-entra-user` | Operator-facing entrypoint that takes non-secret user fields (`displayName`, `userPrincipalName`, optional `mailNickname`) and delegates to `azure-ad-user.provision`. The temp password is generated inside the model and never crosses an input, log, audit entry, or stored resource. Expects an `azure-ad-user` instance named `entra-users`. |
 | `@dougschaefer/azure-rbac-audit` | Read-only subscription RBAC snapshot for access reviews: every role assignment at every scope (including management-group inheritance on az CLI 2.87+), every deny assignment, and every custom role definition, captured as versioned model data. Pass `fast: true` to skip principal/role-name resolution on large tenants. Expects an `azure-role-assignment` instance named `rbac-assignments`. |
 | `@dougschaefer/azure-ai-inventory` | Read-only subscription AI footprint snapshot: every AI Services account, every model deployment (single fan-out run), and every AI Search service. Expects an `azure-ai-foundry` instance named `ai-foundry` and an `azure-ai-search` instance named `ai-search`. |
+| `@dougschaefer/azure-cost-review` | Read-only monthly cost review. Pulls billed spend sliced by service, meter, and resource, then gathers acting evidence: VM utilization, a network-spend audit, an orphan sweep, and Advisor/reservation recommendations. Uses direct type execution, so it needs no pre-existing model instance — pass `subscriptionId` (and `hubResourceGroup` if the subscription has hub networking). Steps run sequentially because they share one model's lock. |
 
 ## Installation
 

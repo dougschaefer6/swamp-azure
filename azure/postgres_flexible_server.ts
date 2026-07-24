@@ -103,7 +103,7 @@ const PostgresFirewallRuleSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-postgres-flexible-server",
-  version: "2026.07.17.1",
+  version: "2026.07.24.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     server: {

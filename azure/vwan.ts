@@ -139,13 +139,16 @@ const VpnGatewaySchema = z
  * site methods (list, get, create, delete) configure on-prem
  * endpoint metadata (device, address space, link properties) for
  * S2S VPN. VPN-gateway methods (listVpnGateways, getVpnGateway)
- * inspect the gateways and their tunnels. inventory aggregates the
- * vWAN posture for audit. Critical for site-to-site VPN tunnels and
- * the hub DNAT pattern.
+ * inspect the gateways and their tunnels, and setVpnGatewayScaleUnit
+ * adjusts their provisioned throughput — the primary cost lever on a
+ * vWAN S2S gateway, since scale units bill hourly whether or not the
+ * tunnels carry traffic. inventory aggregates the vWAN posture for
+ * audit. Critical for site-to-site VPN tunnels and the hub DNAT
+ * pattern.
  */
 export const model = {
   type: "@dougschaefer/azure-vwan",
-  version: "2026.07.17.1",
+  version: "2026.07.24.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     vwan: {
@@ -915,6 +918,88 @@ export const model = {
           "vpnGateway",
           sanitizeInstanceName(args.name),
           gw,
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    setVpnGatewayScaleUnit: {
+      description:
+        "Set the scale unit count on a site-to-site VPN gateway. Each scale unit is 500 Mbps of aggregate tunnel throughput and is billed hourly whether or not tunnels carry traffic, so this is the primary cost lever on a vWAN S2S gateway. Idempotent — a no-op when the gateway is already at the requested count. Re-provisioning briefly interrupts every tunnel on the gateway.",
+      arguments: z.object({
+        name: z.string().describe("VPN gateway name"),
+        resourceGroup: z.string().optional().describe("Resource group name"),
+        scaleUnit: z
+          .number()
+          .int()
+          .min(1)
+          .describe(
+            "Target scale unit count (minimum 1). Each unit is 500 Mbps aggregate.",
+          ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const rg = requireResourceGroup(args.resourceGroup, g.resourceGroup);
+
+        const current = (await az(
+          [
+            "network",
+            "vpn-gateway",
+            "show",
+            "--name",
+            args.name,
+            "--resource-group",
+            rg,
+          ],
+          g.subscriptionId,
+        )) as { vpnGatewayScaleUnit?: number };
+
+        if (current.vpnGatewayScaleUnit === args.scaleUnit) {
+          context.logger.info(
+            "VPN gateway {name} is already at {scaleUnit} scale unit(s) — no change",
+            { name: args.name, scaleUnit: args.scaleUnit },
+          );
+          const handle = await context.writeResource(
+            "vpnGateway",
+            sanitizeInstanceName(args.name),
+            current,
+          );
+          return { dataHandles: [handle] };
+        }
+
+        context.logger.info(
+          "Scaling VPN gateway {name} from {from} to {to} scale unit(s) — tunnels will briefly drop",
+          {
+            name: args.name,
+            from: current.vpnGatewayScaleUnit ?? "unknown",
+            to: args.scaleUnit,
+          },
+        );
+
+        const updated = await az(
+          [
+            "network",
+            "vpn-gateway",
+            "update",
+            "--name",
+            args.name,
+            "--resource-group",
+            rg,
+            "--scale-unit",
+            String(args.scaleUnit),
+          ],
+          g.subscriptionId,
+        );
+
+        context.logger.info("VPN gateway {name} now at {to} scale unit(s)", {
+          name: args.name,
+          to: args.scaleUnit,
+        });
+
+        const handle = await context.writeResource(
+          "vpnGateway",
+          sanitizeInstanceName(args.name),
+          updated,
         );
         return { dataHandles: [handle] };
       },

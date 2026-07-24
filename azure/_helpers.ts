@@ -105,6 +105,59 @@ export async function graphRequest(
 }
 
 /**
+ * Acquire an Azure Resource Manager access token from the active `az login`
+ * session. Same handling as {@link graphToken} — the token arrives in `az`'s
+ * JSON output, lives only in memory, and is never logged or persisted.
+ */
+export async function armToken(): Promise<string> {
+  const result = (await az(
+    [
+      "account",
+      "get-access-token",
+      "--resource",
+      "https://management.azure.com",
+    ],
+    undefined,
+  )) as { accessToken?: string } | null;
+  const token = result?.accessToken;
+  if (!token) {
+    throw new Error(
+      "Could not acquire an ARM access token from the active az session",
+    );
+  }
+  return token;
+}
+
+/**
+ * Make an authenticated Azure Resource Manager request against a full ARM
+ * URL. Used for control-plane APIs the `az` CLI covers poorly or not at all —
+ * Cost Management queries, Resource Graph, and Consumption reservation
+ * recommendations — where the CLI either lacks the verb or requires an
+ * optional CLI extension. Throws on non-2xx so callers get the ARM error text
+ * rather than silently parsing an error envelope.
+ */
+export async function armRequest(
+  method: string,
+  url: string,
+  body?: unknown,
+): Promise<unknown> {
+  const token = await armToken();
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`ARM ${method} ${res.status}: ${text.slice(0, 600)}`);
+  }
+  return text ? JSON.parse(text) : null;
+}
+
+/**
  * Classify an error thrown by {@link az} as a "not found" condition, so
  * delete-style methods can treat an already-absent target as success
  * (idempotent delete) rather than failing the workflow.

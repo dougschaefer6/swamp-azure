@@ -50,7 +50,7 @@ const PublicIpSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-public-ip",
-  version: "2026.07.17.1",
+  version: "2026.07.24.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     publicIp: {

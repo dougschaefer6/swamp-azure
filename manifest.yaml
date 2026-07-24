@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@dougschaefer/azure"
-version: "2026.07.17.1"
-description: "Azure infrastructure management via az CLI — 42 model types covering compute, networking, data, security, RBAC, Azure Policy, Defender for Cloud, Entra directory, monitoring, DNS, DevOps, Azure AI Foundry (accounts, model deployments, projects, quota), AI Search, Cosmos DB, PostgreSQL Flexible Server, Static Web Apps, Service Bus, Event Grid, Recovery Services, Log Analytics, subscription-wide topology with Mermaid diagrams and cost estimation, and the Azure AI Vision Face REST API for identity-aware room services."
+version: "2026.07.24.1"
+description: "Azure infrastructure management via az CLI — 43 model types covering compute, networking, data, security, RBAC, Azure Policy, Defender for Cloud, Entra directory, monitoring, DNS, DevOps, Azure AI Foundry (accounts, model deployments, projects, quota), AI Search, Cosmos DB, PostgreSQL Flexible Server, Static Web Apps, Service Bus, Event Grid, Recovery Services, Log Analytics, subscription-wide topology with Mermaid diagrams and cost estimation, actual-spend cost analysis and waste auditing via Cost Management/Resource Graph/Advisor, and the Azure AI Vision Face REST API for identity-aware room services."
 repository: https://github.com/dougschaefer6/swamp-azure
 additionalFiles:
   - README.md
@@ -9,6 +9,8 @@ additionalFiles:
 labels:
   - azure
   - cloud
+  - cost
+  - finops
   - networking
   - vm
   - firewall
@@ -19,10 +21,8 @@ labels:
   - security
   - face
   - cognitive-services
-  - iars
   - ai
   - foundry
-  - openai
   - cosmos
   - messaging
   - postgres
@@ -31,6 +31,7 @@ workflows:
   - provision_entra_user.yaml
   - azure_rbac_audit.yaml
   - azure_ai_inventory.yaml
+  - azure_cost_review.yaml
   - boards_state_rollup.yaml
 models:
   - azure/ad_app_registration.ts
@@ -42,6 +43,7 @@ models:
   - azure/application_gateway.ts
   - azure/bastion.ts
   - azure/cosmos.ts
+  - azure/cost.ts
   - azure/defender.ts
   - azure/devops.ts
   - azure/disk.ts

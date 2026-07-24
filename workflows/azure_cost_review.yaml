@@ -1,0 +1,201 @@
+id: 815ea2a3-2c27-4c03-b11f-cbbc89060ec8
+name: "@dougschaefer/azure-cost-review"
+description: >-
+  Repeatable Azure cost review for a subscription. Pulls actual billed spend from
+  Cost Management sliced three ways (by service for the shape of the bill, by meter
+  to expose silent rate changes such as an added VPN scale unit or connection unit,
+  and by resource to rank individual line items), then gathers the evidence needed
+  to act on it: per-VM CPU and network utilization, a network-spend audit that
+  checks whether expensive plumbing is actually in the data path, an orphaned-resource
+  sweep, and first-party Advisor and reservation recommendations.
+
+  Steps run sequentially rather than in parallel on purpose — every step targets the
+  same model instance, and concurrent method runs contend on the per-model lock.
+
+  Two standing cautions the outputs will not state for you. Advisor reads idle CPU
+  without knowing workload intent, so its resize advice is evidence, not instruction:
+  a capacity-sized appliance such as a conferencing or media node looks idle by design
+  and must be judged on traffic counters and its vendor's core-count floor, not on CPU
+  percentage. And settle right-sizing before buying any reservation, since a
+  reservation bought against a SKU you are about to change is wasted money.
+tags: {}
+inputs:
+  properties:
+    subscriptionId:
+      type: string
+      description: Azure subscription to review.
+    hubResourceGroup:
+      type: string
+      description: >-
+        Resource group holding the hub firewall and VPN gateways, scoping the
+        network-spend audit. Omit on subscriptions with no hub networking.
+    costWindowDays:
+      type: integer
+      description: Look-back window in days for the billed-cost queries.
+      default: 90
+    utilizationDays:
+      type: integer
+      description: >-
+        Look-back window in days for utilization, throughput, and tunnel-liveness
+        measurement.
+      default: 30
+    snapshotAgeDays:
+      type: integer
+      description: Flag snapshots older than this many days as stale.
+      default: 90
+  required:
+    - subscriptionId
+jobs:
+  - name: spend
+    description: >-
+      What was actually billed, sliced three ways. These steps are the factual
+      backbone of the review and must succeed for the run to be meaningful.
+    steps:
+      - name: cost-by-service
+        description: >-
+          Billed cost per Azure service per month — the top-level shape of the bill
+          and the fastest way to see whether compute or network dominates.
+        task:
+          type: model_method
+          modelType: '@dougschaefer/azure-cost'
+          modelName: azure-cost-review
+          methodName: queryCosts
+          inputs:
+            subscriptionId: '${{ inputs.subscriptionId }}'
+            groupBy: ServiceName
+            granularity: Monthly
+            days: '${{ inputs.costWindowDays }}'
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: cost-by-meter
+        description: >-
+          Billed cost per meter per month. This is the slice that catches silent
+          increases a service-level rollup hides — an added gateway scale unit, a new
+          connection unit per branch, or a firewall tier change all show up here as a
+          changed hour count on a specific meter.
+        task:
+          type: model_method
+          modelType: '@dougschaefer/azure-cost'
+          modelName: azure-cost-review
+          methodName: queryCosts
+          inputs:
+            subscriptionId: '${{ inputs.subscriptionId }}'
+            groupBy: Meter
+            granularity: Monthly
+            days: '${{ inputs.costWindowDays }}'
+        dependsOn:
+          - step: cost-by-service
+            condition:
+              type: always
+        weight: 0
+        allowFailure: false
+      - name: cost-by-resource
+        description: >-
+          Billed cost per individual resource, ranking the specific line items so the
+          largest few can be attacked directly.
+        task:
+          type: model_method
+          modelType: '@dougschaefer/azure-cost'
+          modelName: azure-cost-review
+          methodName: queryCosts
+          inputs:
+            subscriptionId: '${{ inputs.subscriptionId }}'
+            groupBy: ResourceId
+            granularity: None
+            days: '${{ inputs.costWindowDays }}'
+        dependsOn:
+          - step: cost-by-meter
+            condition:
+              type: always
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+  - name: evidence
+    description: >-
+      The measurements and findings needed to decide what to change. These steps are
+      additive — each is allowed to fail so that a single throttled or unavailable API
+      still leaves a usable review rather than no review at all.
+    steps:
+      - name: vm-utilization
+        description: >-
+          Per-VM CPU and network utilization over the window, with an idle/oversized
+          verdict. Network counters carry as much weight as CPU: they are what
+          separates a genuinely idle VM from a quiet appliance that is still serving.
+        task:
+          type: model_method
+          modelType: '@dougschaefer/azure-cost'
+          modelName: azure-cost-review
+          methodName: vmUtilization
+          inputs:
+            subscriptionId: '${{ inputs.subscriptionId }}'
+            days: '${{ inputs.utilizationDays }}'
+        dependsOn: []
+        weight: 0
+        allowFailure: true
+      - name: network-audit
+        description: >-
+          Checks whether network spend is earning its price — secured-hub firewall
+          actually in the data path, broad allow rules shadowing narrower ones,
+          gateway scale units against observed peak throughput, and tunnels with no
+          measured traffic. Link liveness is judged from time-series metrics rather
+          than the gateway's cumulative byte counters, which reset on re-provision and
+          would otherwise report busy tunnels as dead.
+        task:
+          type: model_method
+          modelType: '@dougschaefer/azure-cost'
+          modelName: azure-cost-review
+          methodName: auditNetworkSpend
+          inputs:
+            subscriptionId: '${{ inputs.subscriptionId }}'
+            resourceGroup: '${{ inputs.hubResourceGroup }}'
+            days: '${{ inputs.utilizationDays }}'
+        dependsOn:
+          - step: vm-utilization
+            condition:
+              type: always
+        weight: 0
+        allowFailure: true
+      - name: orphan-sweep
+        description: >-
+          Resources that bill without serving anything — unattached disks, public IPs
+          associated with nothing, ownerless NICs, and stale snapshots.
+        task:
+          type: model_method
+          modelType: '@dougschaefer/azure-cost'
+          modelName: azure-cost-review
+          methodName: findOrphans
+          inputs:
+            subscriptionId: '${{ inputs.subscriptionId }}'
+            snapshotAgeDays: '${{ inputs.snapshotAgeDays }}'
+        dependsOn:
+          - step: network-audit
+            condition:
+              type: always
+        weight: 0
+        allowFailure: true
+      - name: advisor
+        description: >-
+          First-party Azure Advisor cost recommendations and Consumption reservation
+          recommendations, collected last so they are read against the utilization and
+          audit evidence above rather than on their own.
+        task:
+          type: model_method
+          modelType: '@dougschaefer/azure-cost'
+          modelName: azure-cost-review
+          methodName: advisorCostRecommendations
+          inputs:
+            subscriptionId: '${{ inputs.subscriptionId }}'
+        dependsOn:
+          - step: orphan-sweep
+            condition:
+              type: always
+        weight: 0
+        allowFailure: true
+    dependsOn:
+      - job: spend
+        condition:
+          type: always
+    weight: 0
+version: 1

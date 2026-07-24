@@ -68,7 +68,7 @@ const PeeringSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-vnet",
-  version: "2026.07.17.1",
+  version: "2026.07.24.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     vnet: {
