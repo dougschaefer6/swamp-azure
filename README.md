@@ -379,6 +379,9 @@ Microsoft Defender for Cloud posture and detections. `setPricing` changes billin
 | `listActivityLogAlerts` | List activity log alerts in a resource group or subscription |
 | `listActionGroups` | List action groups in a resource group or subscription |
 | `getDiagnosticSettings` | Get diagnostic settings for a specific resource |
+| `setDiagnosticSetting` | Create or converge a diagnostic setting shipping a resource's logs to Log Analytics (idempotent) |
+
+`setDiagnosticSetting` defaults to resource-specific (`Dedicated`) mode, which lands rows in per-category tables such as `AZFWNetworkRule` instead of the legacy catch-all `AzureDiagnostics` table — cheaper to ingest and far easier to query. Worth checking on anything expensive: a resource with no diagnostic setting emits nothing at all. Platform metrics still report that a firewall is evaluating rules, but without a diagnostic setting there is no record of what was allowed or denied, which means no incident investigation, no audit evidence, and no way to tune a policy from denies you never captured.
 
 ### azure-network-watcher
 

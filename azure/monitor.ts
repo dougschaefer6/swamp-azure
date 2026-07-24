@@ -81,7 +81,7 @@ const ActionGroupSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-monitor",
-  version: "2026.07.24.1",
+  version: "2026.07.24.2",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     metricAlert: {
@@ -250,6 +250,131 @@ export const model = {
           handles.push(handle);
         }
         return { dataHandles: handles };
+      },
+    },
+
+    setDiagnosticSetting: {
+      description:
+        "Create or converge a diagnostic setting that ships a resource's logs to a Log Analytics workspace. Idempotent — an existing setting of the same name is replaced so the declared categories are exactly what ends up configured. Prefer resourceSpecific (the default), which lands rows in per-category tables such as AZFWNetworkRule rather than the legacy catch-all AzureDiagnostics table; it ingests cheaper and queries far more cleanly. A resource with no diagnostic setting emits nothing at all — platform metrics still exist, but there is no record of what traffic or requests it actually handled.",
+      arguments: z.object({
+        resourceId: z
+          .string()
+          .describe("Full Azure resource ID to enable diagnostics on"),
+        workspaceId: z
+          .string()
+          .describe("Full resource ID of the target Log Analytics workspace"),
+        name: z
+          .string()
+          .default("diag-to-law")
+          .describe("Diagnostic setting name"),
+        logCategories: z
+          .array(z.string())
+          .describe(
+            "Log categories to enable. Use `az monitor diagnostic-settings categories list` to see what a resource type supports.",
+          ),
+        includeMetrics: z
+          .boolean()
+          .default(false)
+          .describe("Also ship AllMetrics to the workspace"),
+        resourceSpecific: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Use resource-specific (Dedicated) tables instead of AzureDiagnostics",
+          ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+
+        const existing = (await az(
+          [
+            "monitor",
+            "diagnostic-settings",
+            "list",
+            "--resource",
+            args.resourceId,
+          ],
+          g.subscriptionId,
+        )) as
+          | { value?: Array<Record<string, unknown>> }
+          | Array<
+            Record<string, unknown>
+          >;
+        const existingList = Array.isArray(existing)
+          ? existing
+          : existing.value || [];
+
+        if (existingList.some((s) => s.name === args.name)) {
+          context.logger.info(
+            "Replacing existing diagnostic setting {name} so the declared categories are authoritative",
+            { name: args.name },
+          );
+          await az(
+            [
+              "monitor",
+              "diagnostic-settings",
+              "delete",
+              "--name",
+              args.name,
+              "--resource",
+              args.resourceId,
+            ],
+            g.subscriptionId,
+          );
+        }
+
+        const logs = args.logCategories.map((category: string) => ({
+          category,
+          enabled: true,
+        }));
+
+        const cmd = [
+          "monitor",
+          "diagnostic-settings",
+          "create",
+          "--name",
+          args.name,
+          "--resource",
+          args.resourceId,
+          "--workspace",
+          args.workspaceId,
+          "--logs",
+          JSON.stringify(logs),
+        ];
+        if (args.includeMetrics) {
+          cmd.push(
+            "--metrics",
+            JSON.stringify([{ category: "AllMetrics", enabled: true }]),
+          );
+        }
+        if (args.resourceSpecific) {
+          cmd.push("--export-to-resource-specific", "true");
+        }
+
+        const created = (await az(cmd, g.subscriptionId)) as Record<
+          string,
+          unknown
+        >;
+
+        context.logger.info(
+          "Diagnostic setting {name} now ships {count} log category/categories from {resource} to {workspace}",
+          {
+            name: args.name,
+            count: logs.length,
+            resource: args.resourceId.split("/").pop(),
+            workspace: args.workspaceId.split("/").pop(),
+          },
+        );
+        for (const l of logs) {
+          context.logger.info("  [on] {category}", { category: l.category });
+        }
+
+        const handle = await context.writeResource(
+          "diagnosticSetting",
+          sanitizeInstanceName(args.name),
+          created,
+        );
+        return { dataHandles: [handle] };
       },
     },
   },

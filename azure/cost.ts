@@ -252,7 +252,7 @@ async function metricByDimension(
  */
 export const model = {
   type: "@dougschaefer/azure-cost",
-  version: "2026.07.24.1",
+  version: "2026.07.24.2",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     costQuery: {
@@ -583,11 +583,47 @@ export const model = {
                   resource: name,
                   resourceType: "Microsoft.Network/azureFirewalls",
                   detail:
-                    `Secured-hub firewall '${name}' (${tier}) has no routing intent on its hub, so spoke and branch traffic is not steered through it. It is billed at roughly $${monthly}/mo while inspecting nothing beyond inbound DNAT.`,
-                  estimatedMonthlySavingsUsd: monthly,
-                  evidence: { tier, hub: hubId.split("/").pop(), hourly },
+                    `Secured-hub firewall '${name}' (${tier}) has no routing intent configured on its hub. A Virtual WAN hub is a router first: deploying a firewall into it does not steer anything through it, so without an Internet or Private traffic routing policy all spoke-to-spoke, branch-to-spoke and internet-egress traffic keeps its direct next hop and bypasses the firewall entirely. Inbound DNAT still works, because that arrives on the firewall's own public IP independently of hub routing. The appliance costs about $${monthly}/mo. Treat that as cost at risk, not recoverable savings — three options: enable routing intent so it performs the east-west and egress enforcement it was bought for, downgrade the tier and keep it as a DNAT box, or re-home the DNAT and remove it.`,
+                  // Deliberately null: none of this is recoverable without
+                  // first deciding where DNAT lives, so reporting the
+                  // deployment cost as "savings" would overstate the case.
+                  estimatedMonthlySavingsUsd: null,
+                  evidence: {
+                    tier,
+                    hub: hubId.split("/").pop(),
+                    hourly,
+                    monthlyDeploymentCostUsd: monthly,
+                  },
                 });
               }
+            }
+
+            // An expensive appliance with no diagnostic setting emits nothing:
+            // platform metrics still show rules being evaluated, but there is
+            // no record of what was allowed or denied, so neither an incident
+            // nor a rule-tuning exercise has anything to work from.
+            try {
+              const diag = (await armRequest(
+                "GET",
+                `${ARM}${fw.id}/providers/Microsoft.Insights/diagnosticSettings?api-version=2021-05-01-preview`,
+              )) as { value?: unknown[] };
+              if (!diag?.value?.length) {
+                add({
+                  category: "no-diagnostic-logging",
+                  severity: "high",
+                  resource: name,
+                  resourceType: "Microsoft.Network/azureFirewalls",
+                  detail:
+                    `Firewall '${name}' has no diagnostic settings, so it ships no logs anywhere. At roughly $${monthly}/mo this is a security control with no telemetry: no record of allowed or denied flows, nothing to investigate an incident with, and no evidence for an audit. It also makes rule changes unobservable — you cannot tune a policy from denies you never recorded. Send AZFWNetworkRule, AZFWNatRule and AZFWApplicationRule to a Log Analytics workspace in resource-specific mode.`,
+                  estimatedMonthlySavingsUsd: null,
+                  evidence: { tier, monthlyDeploymentCostUsd: monthly },
+                });
+              }
+            } catch (err) {
+              context.logger.warn(
+                "Diagnostic-setting check skipped for {name}: {err}",
+                { name, err: String(err) },
+              );
             }
 
             // Shadowing: a broad Allow in a lower-priority-number group wins.
