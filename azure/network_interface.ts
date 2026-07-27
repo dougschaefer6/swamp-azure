@@ -64,7 +64,7 @@ const NetworkInterfaceSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-network-interface",
-  version: "2026.07.24.2",
+  version: "2026.07.24.3",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     networkInterface: {

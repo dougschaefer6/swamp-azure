@@ -67,12 +67,19 @@ const ConnectionMonitorSchema = z
  * configurations, and test groups. checkConnectivity runs a one-shot
  * source-to-destination reachability probe useful for diagnosing
  * spoke-to-spoke or on-prem-to-Azure traffic against the hub
- * firewall. Useful as the inventory backbone for compliance reports
- * (every region has a Network Watcher, every NSG has a flow log).
+ * firewall. setFlowLog creates or converges a flow log on a virtual
+ * network, subnet, or NIC — optionally with Traffic Analytics —
+ * deriving the right CLI flag from the target resource ID; target a
+ * VNet rather than an NSG, since Azure blocked new NSG flow logs on
+ * 2025-06-30 ahead of their 2027-09-30 retirement. Flow logs are the
+ * only record of which 5-tuples actually crossed the network, which
+ * rules alone can never tell you. Useful as the inventory backbone
+ * for compliance reports (every region has a Network Watcher, every
+ * VNet has a flow log).
  */
 export const model = {
   type: "@dougschaefer/azure-network-watcher",
-  version: "2026.07.24.2",
+  version: "2026.07.24.3",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     watcher: {
@@ -271,6 +278,141 @@ export const model = {
             `connectivity-${args.destAddress}-${args.destPort}`,
           ),
           result as Record<string, unknown>,
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    setFlowLog: {
+      description:
+        "Create or converge a flow log, optionally with Traffic Analytics. Flow logs are the only record of which 5-tuples actually crossed the network — rules state what is permitted, never what is used, so they cannot tell you whether a rule is load-bearing or dead. Indispensable before inserting a firewall into an existing path, where you need observed flows rather than assumed ones. Target a virtual network: Azure blocked creation of new *NSG* flow logs on 2025-06-30 ahead of their 2027-09-30 retirement, and VNet flow logs supersede them with broader coverage. The flow log, its storage account, and any Traffic Analytics workspace must all be in the same region as the target.",
+      arguments: z.object({
+        name: z.string().describe("Flow log resource name"),
+        targetResourceId: z
+          .string()
+          .describe(
+            "Full resource ID of the target — a virtual network (preferred), subnet, or NIC. Network security groups are rejected by Azure for new flow logs.",
+          ),
+        storageAccountId: z
+          .string()
+          .describe("Full resource ID of the storage account for raw logs"),
+        location: z
+          .string()
+          .default("centralus")
+          .describe("Region of the NSG and its Network Watcher"),
+        retentionDays: z
+          .number()
+          .int()
+          .min(0)
+          .default(30)
+          .describe("Days to retain raw flow logs. 0 retains indefinitely."),
+        workspaceId: z
+          .string()
+          .optional()
+          .describe(
+            "Log Analytics workspace resource ID to enable Traffic Analytics. Omit for raw storage only.",
+          ),
+        // Deliberately a plain int rather than a literal union: CLI --input
+        // arrives as a string, which z.number() coerces but z.literal() does
+        // not, so a union of literals rejects every command-line invocation.
+        trafficAnalyticsIntervalMinutes: z
+          .number()
+          .int()
+          .default(60)
+          .describe(
+            "Traffic Analytics processing interval in minutes — 10 or 60. 10 costs materially more.",
+          ),
+        enabled: z.boolean().default(true).describe("Enable the flow log"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+
+        if (
+          args.workspaceId &&
+          args.trafficAnalyticsIntervalMinutes !== 10 &&
+          args.trafficAnalyticsIntervalMinutes !== 60
+        ) {
+          throw new Error(
+            `trafficAnalyticsIntervalMinutes must be 10 or 60, got ${args.trafficAnalyticsIntervalMinutes}`,
+          );
+        }
+
+        // The CLI takes a different flag per target kind, so derive it from
+        // the resource ID rather than making the caller restate it.
+        const id = args.targetResourceId.toLowerCase();
+        const targetFlag = id.includes("/subnets/")
+          ? "--subnet"
+          : id.includes("/networkinterfaces/")
+          ? "--nic"
+          : id.includes("/virtualnetworks/")
+          ? "--vnet"
+          : id.includes("/networksecuritygroups/")
+          ? "--nsg"
+          : null;
+        if (!targetFlag) {
+          throw new Error(
+            `Cannot determine flow-log target kind from resource ID: ${args.targetResourceId}`,
+          );
+        }
+        if (targetFlag === "--nsg") {
+          context.logger.warn(
+            "Targeting an NSG — Azure blocks creation of new NSG flow logs since 2025-06-30 (retiring 2027-09-30). Target the virtual network instead.",
+          );
+        }
+
+        const cmd = [
+          "network",
+          "watcher",
+          "flow-log",
+          "create",
+          "--name",
+          args.name,
+          "--location",
+          args.location,
+          targetFlag,
+          args.targetResourceId,
+          "--storage-account",
+          args.storageAccountId,
+          "--retention",
+          String(args.retentionDays),
+          "--enabled",
+          args.enabled ? "true" : "false",
+        ];
+        if (args.workspaceId) {
+          cmd.push(
+            "--workspace",
+            args.workspaceId,
+            "--traffic-analytics",
+            "true",
+            "--interval",
+            String(args.trafficAnalyticsIntervalMinutes),
+          );
+        }
+
+        const flowLog = (await az(cmd, g.subscriptionId)) as Record<
+          string,
+          unknown
+        >;
+
+        context.logger.info(
+          "Flow log {name} on {target}: enabled={enabled} retention={days}d trafficAnalytics={ta}",
+          {
+            name: args.name,
+            target: args.targetResourceId.split("/").pop(),
+            enabled: args.enabled,
+            days: args.retentionDays,
+            ta: args.workspaceId
+              ? `${
+                args.workspaceId.split("/").pop()
+              } @${args.trafficAnalyticsIntervalMinutes}m`
+              : "off",
+          },
+        );
+
+        const handle = await context.writeResource(
+          "flowLog",
+          sanitizeInstanceName(args.name),
+          flowLog,
         );
         return { dataHandles: [handle] };
       },

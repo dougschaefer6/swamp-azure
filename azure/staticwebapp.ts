@@ -40,7 +40,7 @@ const EnvironmentSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-staticwebapp",
-  version: "2026.07.24.2",
+  version: "2026.07.24.3",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     site: {

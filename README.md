@@ -37,7 +37,7 @@ Most models include a `sync` method that refreshes stored state without making c
 | `azure-policy` | Azure Policy assignments, definitions, initiatives, and compliance state |
 | `azure-defender` | Microsoft Defender for Cloud pricing, secure score, assessments, and alerts |
 | `azure-monitor` | Metric alerts, activity log alerts, action groups, and diagnostic settings |
-| `azure-network-watcher` | Network Watcher instances, flow logs, connection monitors, and connectivity checks |
+| `azure-network-watcher` | Network Watcher instances, flow logs (VNet/subnet/NIC, with Traffic Analytics), connection monitors, and connectivity checks |
 | `azure-dns` | DNS zones and records with full record type support |
 | `azure-devops` | Projects, repos, pipelines, builds, work items, service connections, variable groups, pull requests, and agent pools |
 | `azure-vwan` | Virtual WANs, hubs, hub connections, VPN sites, and VPN gateways |
@@ -391,6 +391,11 @@ Microsoft Defender for Cloud posture and detections. `setPricing` changes billin
 | `listFlowLogs` | List NSG flow logs for a Network Watcher |
 | `listConnectionMonitors` | List connection monitors for a Network Watcher |
 | `checkConnectivity` | Test connectivity from a source VM to a destination endpoint |
+| `setFlowLog` | Create or converge a flow log on a VNet, subnet, or NIC, optionally with Traffic Analytics |
+
+Flow logs are the only record of which 5-tuples actually crossed the network. NSG and firewall rules state what is *permitted*, never what is *used*, so they cannot tell you whether a rule is load-bearing or dead — which makes them a poor basis for planning a change to the traffic path.
+
+`setFlowLog` derives the correct CLI flag from the target's resource ID, and **target a virtual network, not an NSG**: Azure blocked creation of new NSG flow logs on 2025-06-30 ahead of their 2027-09-30 retirement, and VNet flow logs supersede them with broader coverage. Existing NSG flow logs keep working until retirement. The flow log, its storage account, and any Traffic Analytics workspace must all sit in the same region as the target. Traffic Analytics accepts a 10- or 60-minute interval; 10 costs materially more.
 
 ### azure-dns
 
