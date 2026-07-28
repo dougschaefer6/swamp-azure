@@ -50,7 +50,7 @@ const KeyVaultSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-key-vault",
-  version: "2026.07.24.3",
+  version: "2026.07.28.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     keyVault: {
