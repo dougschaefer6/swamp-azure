@@ -83,7 +83,7 @@ const ProtectionResultSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-recovery-services-vault",
-  version: "2026.07.28.1",
+  version: "2026.07.28.2",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     vault: {
@@ -234,41 +234,75 @@ export const model = {
 
     listBackupItems: {
       description:
-        "List all protected (backup) items registered with a vault (read-only).",
+        "List protected (backup) items (read-only). Omit vaultName to fan out across every vault in the resource group, or the whole subscription — which is what lets an audit ask 'is this VM backed up anywhere?' without knowing the vault names.",
       arguments: z.object({
-        vaultName: z.string().describe("Vault name"),
-        resourceGroup: z.string().optional().describe("Resource group name"),
+        vaultName: z
+          .string()
+          .optional()
+          .describe("Vault name. Omit to cover every vault in scope."),
+        resourceGroup: z
+          .string()
+          .optional()
+          .describe(
+            "Resource group. Omit with vaultName omitted to sweep the subscription.",
+          ),
       }),
       execute: async (args, context) => {
         const g = context.globalArgs;
-        const rg = requireResourceGroup(args.resourceGroup, g.resourceGroup);
-        const items = (await az(
-          [
-            "backup",
-            "item",
-            "list",
-            "--vault-name",
-            args.vaultName,
-            "--resource-group",
-            rg,
-          ],
-          g.subscriptionId,
-        )) as Array<Record<string, unknown>>;
+        const rg = args.resourceGroup || g.resourceGroup;
 
-        context.logger.info("Found {count} backup items in {vault}", {
-          count: items.length,
-          vault: args.vaultName,
-        });
+        const targets: Array<{ name: string; rg: string }> = [];
+        if (args.vaultName) {
+          targets.push({
+            name: args.vaultName,
+            rg: requireResourceGroup(args.resourceGroup, g.resourceGroup),
+          });
+        } else {
+          const listArgs = ["backup", "vault", "list"];
+          if (rg) listArgs.push("--resource-group", rg);
+          const vaults = (await az(listArgs, g.subscriptionId)) as Array<
+            Record<string, unknown>
+          >;
+          for (const v of vaults) {
+            targets.push({
+              name: v.name as string,
+              rg: v.resourceGroup as string,
+            });
+          }
+          context.logger.info("Sweeping {count} vault(s) for backup items", {
+            count: targets.length,
+          });
+        }
 
         const handles = [];
-        for (const item of items) {
-          const instanceName = `${args.vaultName}--${item.name as string}`;
-          const handle = await context.writeResource(
-            "backupItem",
-            sanitizeInstanceName(instanceName),
-            item,
-          );
-          handles.push(handle);
+        for (const target of targets) {
+          const items = (await az(
+            [
+              "backup",
+              "item",
+              "list",
+              "--vault-name",
+              target.name,
+              "--resource-group",
+              target.rg,
+            ],
+            g.subscriptionId,
+          )) as Array<Record<string, unknown>>;
+
+          context.logger.info("Found {count} backup items in {vault}", {
+            count: items.length,
+            vault: target.name,
+          });
+
+          for (const item of items) {
+            const instanceName = `${target.name}--${item.name as string}`;
+            const handle = await context.writeResource(
+              "backupItem",
+              sanitizeInstanceName(instanceName),
+              { ...item, vaultName: target.name },
+            );
+            handles.push(handle);
+          }
         }
         return { dataHandles: handles };
       },
