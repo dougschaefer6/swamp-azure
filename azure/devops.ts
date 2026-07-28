@@ -178,7 +178,7 @@ const AgentPoolSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-devops",
-  version: "2026.07.28.3",
+  version: "2026.07.28.4",
   globalArguments: DevOpsGlobalArgsSchema,
   resources: {
     project: {

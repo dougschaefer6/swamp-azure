@@ -46,7 +46,7 @@ const VmInstanceViewSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-vm",
-  version: "2026.07.28.3",
+  version: "2026.07.28.4",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     vm: {

@@ -29,7 +29,7 @@ const ResourceProviderSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-resource-provider",
-  version: "2026.07.28.3",
+  version: "2026.07.28.4",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     provider: {

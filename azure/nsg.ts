@@ -45,6 +45,21 @@ const NsgSchema = z
   })
   .passthrough();
 
+const RuleSetResultSchema = z
+  .object({
+    nsgName: z.string(),
+    resourceGroup: z.string(),
+    dryRun: z.boolean(),
+    pruneUndeclared: z.boolean(),
+    toCreate: z.array(z.string()),
+    toUpdate: z.array(z.string()),
+    unchanged: z.array(z.string()),
+    undeclared: z.array(z.record(z.string(), z.unknown())),
+    applied: z.array(z.string()),
+    failed: z.array(z.object({ rule: z.string(), error: z.string() })),
+  })
+  .passthrough();
+
 /**
  * `@dougschaefer/azure-nsg` model — Network Security Group and
  * security-rule management, wrapping the `az network nsg` CLI. NSG-
@@ -61,7 +76,7 @@ const NsgSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-nsg",
-  version: "2026.07.28.3",
+  version: "2026.07.28.4",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     nsg: {
@@ -73,6 +88,13 @@ export const model = {
     rule: {
       description: "Individual security rule within an NSG",
       schema: SecurityRuleSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    ruleSetResult: {
+      description:
+        "Outcome of one rule-set convergence — the plan (create/update/unchanged/undeclared) and what was applied",
+      schema: RuleSetResultSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -589,5 +611,295 @@ export const model = {
         return { dataHandles: [] };
       },
     },
+
+    applyRuleSet: {
+      description:
+        "Converge an NSG onto a declared set of rules in ONE execution — creates what is missing, updates what differs, and reports what is present but undeclared. Plans first and only acts when dryRun is false, so the diff can be reviewed before anything changes.",
+      arguments: z.object({
+        nsgName: z.string().describe("NSG name"),
+        resourceGroup: z.string().optional().describe("Resource group name"),
+        rules: z
+          .array(
+            z.object({
+              name: z.string(),
+              priority: z.number(),
+              direction: z.enum(["Inbound", "Outbound"]).default("Inbound"),
+              access: z.enum(["Allow", "Deny"]).default("Allow"),
+              protocol: z.string().default("*"),
+              sourceAddressPrefixes: z.array(z.string()).default(["*"]),
+              destinationPortRanges: z.array(z.string()).default(["*"]),
+              destinationAddressPrefixes: z.array(z.string()).default(["*"]),
+              sourcePortRanges: z.array(z.string()).default(["*"]),
+              description: z.string().optional(),
+            }),
+          )
+          .min(1)
+          .describe("The declared rule set — the intended state of this NSG"),
+        pruneUndeclared: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Delete rules that are present but not declared. Off by default: an access path the declaration missed disappears the moment this is on.",
+          ),
+        dryRun: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Plan only, change nothing. Defaults TRUE because this method rewrites a firewall.",
+          ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const rg = requireResourceGroup(args.resourceGroup, g.resourceGroup);
+
+        const existing = (await az(
+          [
+            "network",
+            "nsg",
+            "rule",
+            "list",
+            "--nsg-name",
+            args.nsgName,
+            "--resource-group",
+            rg,
+          ],
+          g.subscriptionId,
+        )) as Array<Record<string, unknown>>;
+
+        const byName = new Map<string, Record<string, unknown>>();
+        for (const r of existing) {
+          byName.set(String(r.name || "").toLowerCase(), r);
+        }
+
+        const toCreate = [], toUpdate = [], unchanged = [], undeclared = [];
+        const declaredNames = new Set(
+          args.rules.map((r) => r.name.toLowerCase()),
+        );
+
+        for (const want of args.rules) {
+          const have = byName.get(want.name.toLowerCase());
+          if (!have) {
+            toCreate.push(want);
+          } else if (ruleDiffers(want, have)) {
+            toUpdate.push(want);
+          } else {
+            unchanged.push(want.name);
+          }
+        }
+        for (const r of existing) {
+          const name = String(r.name || "");
+          if (!declaredNames.has(name.toLowerCase())) {
+            undeclared.push({
+              name,
+              priority: r.priority,
+              direction: r.direction,
+              access: r.access,
+            });
+          }
+        }
+
+        context.logger.info(
+          "{nsg}: {create} to create, {update} to update, {same} unchanged, {extra} undeclared{mode}",
+          {
+            nsg: args.nsgName,
+            create: toCreate.length,
+            update: toUpdate.length,
+            same: unchanged.length,
+            extra: undeclared.length,
+            mode: args.dryRun ? " (DRY RUN — nothing applied)" : "",
+          },
+        );
+
+        const applied: string[] = [];
+        const failed: Array<{ rule: string; error: string }> = [];
+
+        if (!args.dryRun) {
+          // Creates run BEFORE updates and deletes. A declared Deny that does not
+          // exist yet is the whole point of the convergence, and applying it first
+          // means an interrupted run leaves the NSG more closed, never more open.
+          for (const want of toCreate) {
+            try {
+              await az(
+                ruleArgs("create", args.nsgName, rg, want),
+                g.subscriptionId,
+              );
+              applied.push(`created ${want.name}`);
+              context.logger.info("Created {rule} on {nsg}", {
+                rule: want.name,
+                nsg: args.nsgName,
+              });
+            } catch (err) {
+              failed.push({ rule: want.name, error: String(err) });
+            }
+          }
+          for (const want of toUpdate) {
+            try {
+              await az(
+                ruleArgs("update", args.nsgName, rg, want),
+                g.subscriptionId,
+              );
+              applied.push(`updated ${want.name}`);
+              context.logger.info("Updated {rule} on {nsg}", {
+                rule: want.name,
+                nsg: args.nsgName,
+              });
+            } catch (err) {
+              failed.push({ rule: want.name, error: String(err) });
+            }
+          }
+          if (args.pruneUndeclared) {
+            for (const extra of undeclared) {
+              try {
+                await az(
+                  [
+                    "network",
+                    "nsg",
+                    "rule",
+                    "delete",
+                    "--nsg-name",
+                    args.nsgName,
+                    "--name",
+                    extra.name,
+                    "--resource-group",
+                    rg,
+                    "--yes",
+                  ],
+                  g.subscriptionId,
+                );
+                applied.push(`deleted ${extra.name}`);
+                context.logger.info(
+                  "Deleted undeclared rule {rule} from {nsg}",
+                  {
+                    rule: extra.name,
+                    nsg: args.nsgName,
+                  },
+                );
+              } catch (err) {
+                failed.push({ rule: extra.name, error: String(err) });
+              }
+            }
+          }
+        }
+
+        const result = {
+          nsgName: args.nsgName,
+          resourceGroup: rg,
+          dryRun: args.dryRun,
+          pruneUndeclared: args.pruneUndeclared,
+          toCreate: toCreate.map((r) => r.name),
+          toUpdate: toUpdate.map((r) => r.name),
+          unchanged,
+          undeclared,
+          applied,
+          failed,
+        };
+        const handle = await context.writeResource(
+          "ruleSetResult",
+          sanitizeInstanceName(`${args.nsgName}--ruleset`),
+          result,
+        );
+
+        // Written before raising, so a partially applied rule set is inspectable
+        // rather than lost with the error.
+        if (failed.length > 0) {
+          throw new Error(
+            `Rule set convergence failed for ${failed.length} rule(s) on ${args.nsgName}: ${
+              failed.map((f) => f.rule).join(", ")
+            }`,
+          );
+        }
+
+        return { dataHandles: [handle] };
+      },
+    },
   },
 };
+
+/** Normalise Azure's single-or-list rule fields to a comparable sorted list. */
+function normList(single: unknown, plural: unknown): string[] {
+  if (Array.isArray(plural) && plural.length) {
+    return plural.map((x) => String(x)).sort();
+  }
+  if (single !== undefined && single !== null && String(single) !== "") {
+    return [String(single)];
+  }
+  return [];
+}
+
+/**
+ * Decide whether a live rule already matches its declaration. Azure returns
+ * source and port fields as either a scalar or a list depending on how the rule
+ * was written, and echoes protocol back with inconsistent casing (`TCP` for
+ * rules created through the portal, `Tcp` through the CLI), so both sides are
+ * normalised before comparing. Without that, every run would report drift on
+ * rules that are in fact identical and rewrite them forever.
+ */
+function ruleDiffers(want, have): boolean {
+  if (Number(have.priority) !== Number(want.priority)) return true;
+  if (String(have.direction) !== want.direction) return true;
+  if (String(have.access) !== want.access) return true;
+  if (
+    String(have.protocol).toLowerCase() !== String(want.protocol).toLowerCase()
+  ) return true;
+
+  const pairs: Array<[string[], string[]]> = [
+    [
+      normList(have.sourceAddressPrefix, have.sourceAddressPrefixes),
+      [...want.sourceAddressPrefixes].sort(),
+    ],
+    [
+      normList(have.destinationPortRange, have.destinationPortRanges),
+      [...want.destinationPortRanges].sort(),
+    ],
+    [
+      normList(have.destinationAddressPrefix, have.destinationAddressPrefixes),
+      [...want.destinationAddressPrefixes].sort(),
+    ],
+    [
+      normList(have.sourcePortRange, have.sourcePortRanges),
+      [...want.sourcePortRanges].sort(),
+    ],
+  ];
+  for (const [a, b] of pairs) {
+    if (a.length !== b.length || a.some((x, i) => x !== b[i])) return true;
+  }
+  return false;
+}
+
+/** Build the `az network nsg rule create|update` argv for one declared rule. */
+function ruleArgs(verb: string, nsgName: string, rg: string, want): string[] {
+  const argv = [
+    "network",
+    "nsg",
+    "rule",
+    verb,
+    "--nsg-name",
+    nsgName,
+    "--name",
+    want.name,
+    "--resource-group",
+    rg,
+    "--priority",
+    String(want.priority),
+    "--direction",
+    want.direction,
+    "--access",
+    want.access,
+    "--protocol",
+    want.protocol,
+    "--source-address-prefixes",
+    ...want.sourceAddressPrefixes,
+    "--source-port-ranges",
+    ...want.sourcePortRanges,
+    "--destination-address-prefixes",
+    ...want.destinationAddressPrefixes,
+    "--destination-port-ranges",
+    ...want.destinationPortRanges,
+  ];
+  if (want.description) {
+    // Azure caps rule descriptions at 140 characters and rejects the whole call
+    // if that is exceeded, so truncate rather than fail a firewall change.
+    argv.push("--description", String(want.description).slice(0, 140));
+  }
+  return argv;
+}

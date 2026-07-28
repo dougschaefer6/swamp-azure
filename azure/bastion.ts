@@ -41,7 +41,7 @@ const BastionSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-bastion",
-  version: "2026.07.28.3",
+  version: "2026.07.28.4",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     bastion: {

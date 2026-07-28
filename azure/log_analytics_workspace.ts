@@ -42,7 +42,7 @@ const LogAnalyticsWorkspaceSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-log-analytics-workspace",
-  version: "2026.07.28.3",
+  version: "2026.07.28.4",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     workspace: {

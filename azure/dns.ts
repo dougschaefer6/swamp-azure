@@ -89,7 +89,7 @@ const RecordSetSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-dns",
-  version: "2026.07.28.3",
+  version: "2026.07.28.4",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     zone: {

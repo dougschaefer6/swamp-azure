@@ -46,7 +46,7 @@ const MemberSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-ad-group",
-  version: "2026.07.28.3",
+  version: "2026.07.28.4",
   globalArguments: EntraGlobalArgsSchema,
   resources: {
     group: {
