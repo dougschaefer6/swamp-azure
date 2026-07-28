@@ -46,7 +46,7 @@ const VmInstanceViewSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-vm",
-  version: "2026.07.28.4",
+  version: "2026.07.28.5",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     vm: {
@@ -709,6 +709,56 @@ export const model = {
           return { dataHandles: [handle] };
         }
         return { dataHandles: [] };
+      },
+    },
+
+    assignIdentity: {
+      description:
+        "Enable a system-assigned managed identity on a VM (idempotent). Grants nothing on its own — the identity has no role assignments until one is made — so this is safe to run across a fleet.",
+      arguments: z.object({
+        name: z.string().describe("VM name"),
+        resourceGroup: z.string().optional().describe("Resource group name"),
+        userAssignedIdentities: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Resource ids of user-assigned identities to attach as well. Omit for system-assigned only.",
+          ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const rg = requireResourceGroup(args.resourceGroup, g.resourceGroup);
+
+        const cmdArgs = [
+          "vm",
+          "identity",
+          "assign",
+          "--name",
+          args.name,
+          "--resource-group",
+          rg,
+        ];
+        if (args.userAssignedIdentities?.length) {
+          cmdArgs.push("--identities", ...args.userAssignedIdentities);
+        }
+
+        await az(cmdArgs, g.subscriptionId);
+        context.logger.info("Assigned managed identity to VM {name}", {
+          name: args.name,
+        });
+
+        // Re-read rather than trust the assign call's own output: it returns the
+        // identity alone, and the point of the dataset is the VM's state.
+        const vm = await az(
+          ["vm", "show", "--name", args.name, "--resource-group", rg],
+          g.subscriptionId,
+        );
+        const handle = await context.writeResource(
+          "vm",
+          sanitizeInstanceName(args.name),
+          vm,
+        );
+        return { dataHandles: [handle] };
       },
     },
   },

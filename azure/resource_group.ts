@@ -24,7 +24,7 @@ const ResourceGroupSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-resource-group",
-  version: "2026.07.28.4",
+  version: "2026.07.28.5",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     resourceGroup: {

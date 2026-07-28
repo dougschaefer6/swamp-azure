@@ -88,7 +88,7 @@ const SynchronizationJobSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-ad-service-principal",
-  version: "2026.07.28.4",
+  version: "2026.07.28.5",
   globalArguments: EntraGlobalArgsSchema,
   resources: {
     servicePrincipal: {

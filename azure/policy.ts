@@ -59,7 +59,7 @@ const ComplianceSummarySchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-policy",
-  version: "2026.07.28.4",
+  version: "2026.07.28.5",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     assignment: {
