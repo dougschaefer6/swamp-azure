@@ -14,9 +14,13 @@ const RecoveryServicesVaultSchema = z
     location: z.string(),
     resourceGroup: z.string(),
     sku: z
-      .object({ name: z.string().optional(), tier: z.string().optional() })
+      .object({
+        name: z.string().optional().nullable(),
+        tier: z.string().optional().nullable(),
+      })
       .passthrough()
-      .optional(),
+      .optional()
+      .nullable(),
     properties: z
       .object({
         provisioningState: z.string().optional(),
@@ -83,7 +87,7 @@ const ProtectionResultSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-recovery-services-vault",
-  version: "2026.07.28.2",
+  version: "2026.07.28.3",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     vault: {
@@ -489,7 +493,7 @@ export const model = {
           );
         }
 
-        const cmdArgs = [
+        const base = [
           "backup",
           "vault",
           "backup-properties",
@@ -500,32 +504,64 @@ export const model = {
           rg,
         ];
 
-        if (args.backupStorageRedundancy) {
-          cmdArgs.push(
-            "--backup-storage-redundancy",
-            args.backupStorageRedundancy,
-          );
-        }
-        if (args.crossRegionRestore !== undefined) {
-          cmdArgs.push(
-            "--cross-region-restore-flag",
-            args.crossRegionRestore ? "True" : "False",
-          );
-        }
-        if (args.softDeleteState) {
-          cmdArgs.push("--soft-delete-feature-state", args.softDeleteState);
-        }
-        if (args.softDeleteRetentionDays !== undefined) {
-          cmdArgs.push(
-            "--soft-delete-duration",
-            String(args.softDeleteRetentionDays),
-          );
+        // Redundancy and soft delete MUST be separate invocations. When any
+        // soft-delete flag is present, `az backup vault backup-properties set`
+        // takes a different code path and prints "--backup-storage-redundancy …
+        // will be ignored if provided" — so a combined call silently leaves the
+        // redundancy unset while reporting success. Splitting is not tidiness.
+        if (
+          args.backupStorageRedundancy || args.crossRegionRestore !== undefined
+        ) {
+          const storageArgs = [...base];
+          if (args.backupStorageRedundancy) {
+            storageArgs.push(
+              "--backup-storage-redundancy",
+              args.backupStorageRedundancy,
+            );
+          }
+          if (args.crossRegionRestore !== undefined) {
+            storageArgs.push(
+              "--cross-region-restore-flag",
+              args.crossRegionRestore ? "True" : "False",
+            );
+          }
+          await az(storageArgs, g.subscriptionId);
+          context.logger.info("Set storage properties on vault {name}", {
+            name: args.name,
+          });
         }
 
-        await az(cmdArgs, g.subscriptionId);
-        context.logger.info("Set backup properties on vault {name}", {
-          name: args.name,
-        });
+        if (
+          args.softDeleteState || args.softDeleteRetentionDays !== undefined
+        ) {
+          const softArgs = [...base];
+          if (args.softDeleteState) {
+            softArgs.push("--soft-delete-feature-state", args.softDeleteState);
+          }
+          if (args.softDeleteRetentionDays !== undefined) {
+            softArgs.push(
+              "--soft-delete-duration",
+              String(args.softDeleteRetentionDays),
+            );
+          }
+          try {
+            await az(softArgs, g.subscriptionId);
+            context.logger.info("Set soft-delete properties on vault {name}", {
+              name: args.name,
+            });
+          } catch (err) {
+            // Vaults created recently have soft delete managed by the Vault API
+            // rather than the backup API, and the backup API then refuses to
+            // touch it. That state is AlwaysOn — strictly stronger than anything
+            // this method could ask for — so treating it as fatal would block
+            // enrollment over a property that is already at its safest setting.
+            if (!isSoftDeleteOwnedByVaultApi(err)) throw err;
+            context.logger.info(
+              "Soft delete on {name} is managed by the Vault API and already at its strongest setting — leaving it alone",
+              { name: args.name },
+            );
+          }
+        }
 
         const vault = (await az(
           [
@@ -698,6 +734,21 @@ async function resolveVmId(vm, vmResourceGroup, g, context) {
   }
   context.logger.info("Resolved {vm} to {id}", { vm, id });
   return id;
+}
+
+/**
+ * Classify a `backup-properties set` failure as "soft delete on this vault is
+ * owned by the Vault API". Azure returns this when the property was last written
+ * through the newer vault API, which permanently hands ownership over; the state
+ * it leaves behind is AlwaysOn, so there is nothing to remediate.
+ */
+function isSoftDeleteOwnedByVaultApi(err: unknown): boolean {
+  const msg = String(err).toLowerCase();
+  return (
+    msg.includes("bmsusererrorsoftdeleteusevaultapi") ||
+    (msg.includes("soft delete") && msg.includes("cannot be modified")) ||
+    (msg.includes("soft delete") && msg.includes("vault api"))
+  );
 }
 
 /**

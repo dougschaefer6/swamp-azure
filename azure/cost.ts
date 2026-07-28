@@ -252,7 +252,7 @@ async function metricByDimension(
  */
 export const model = {
   type: "@dougschaefer/azure-cost",
-  version: "2026.07.28.2",
+  version: "2026.07.28.3",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     costQuery: {
