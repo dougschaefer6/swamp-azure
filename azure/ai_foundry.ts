@@ -85,7 +85,7 @@ const FOUNDRY_API_VERSION = "2025-06-01";
  */
 export const model = {
   type: "@dougschaefer/azure-ai-foundry",
-  version: "2026.07.28.5",
+  version: "2026.08.04.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     account: {

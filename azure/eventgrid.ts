@@ -60,7 +60,7 @@ const SubscriptionSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-eventgrid",
-  version: "2026.07.28.5",
+  version: "2026.08.04.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     topic: {

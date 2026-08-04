@@ -31,12 +31,15 @@ const UserSchema = z
     givenName: z.string().nullish(),
     surname: z.string().nullish(),
     jobTitle: z.string().nullish(),
+    department: z.string().nullish(),
     mail: z.string().nullish(),
     mobilePhone: z.string().nullish(),
     officeLocation: z.string().nullish(),
     businessPhones: z.array(z.string()).optional(),
     preferredLanguage: z.string().nullish(),
     accountEnabled: z.boolean().optional(),
+    managerId: z.string().nullish(),
+    managerDisplayName: z.string().nullish(),
   })
   .passthrough();
 
@@ -55,7 +58,10 @@ const MembershipSchema = z
  * list enumerates users (optionally narrowed by an OData `$filter`),
  * get and sync return or refresh one user by UPN or object id, and
  * getMemberGroups resolves the groups a user belongs to for access
- * audits. provision creates a new directory user from non-secret
+ * audits. listWithManagers is the fan-out read: one paged Graph sweep
+ * that returns every user with their manager already resolved, so a
+ * reporting hierarchy costs a single execution instead of one manager
+ * lookup per person. provision creates a new directory user from non-secret
  * profile fields via Microsoft Graph (POST /v1.0/users): it generates
  * a single-use temporary password in-process, sends it in the request
  * body (never in a process argument), creates the account with
@@ -71,7 +77,7 @@ const MembershipSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-ad-user",
-  version: "2026.07.28.5",
+  version: "2026.08.04.1",
   globalArguments: EntraGlobalArgsSchema,
   resources: {
     user: {
@@ -158,6 +164,120 @@ export const model = {
         );
         context.logger.info("Synced user {id}", { id: args.id });
         return { dataHandles: [handle] };
+      },
+    },
+
+    listWithManagers: {
+      description:
+        "Sweep the whole directory and resolve every user's manager in one paged Graph call (GET /users?$expand=manager), writing one user resource per person with managerId and managerDisplayName flattened onto the record. This is the fan-out alternative to calling getManager once per user: it acquires the model lock a single time and emits the entire reporting hierarchy in one execution, which is what a reporting-structure or org-chart view needs.",
+      arguments: z.object({
+        filter: z
+          .string()
+          .optional()
+          .describe(
+            'Server-side OData filter, e.g. "accountEnabled eq true" or "department eq \'Engineering\'"',
+          ),
+        enabledOnly: z
+          .boolean()
+          .optional()
+          .describe(
+            "Keep only enabled accounts, applied after the sweep (default false)",
+          ),
+        requireJobTitle: z
+          .boolean()
+          .optional()
+          .describe(
+            "Keep only accounts that carry a jobTitle, which drops most shared mailboxes and service accounts (default false)",
+          ),
+      }),
+      execute: async (args, context) => {
+        const select = [
+          "id",
+          "displayName",
+          "userPrincipalName",
+          "givenName",
+          "surname",
+          "jobTitle",
+          "department",
+          "mail",
+          "officeLocation",
+          "accountEnabled",
+        ].join(",");
+
+        // Plain $expand=manager needs no advanced-query header; a nested
+        // $select inside the expand would require ConsistencyLevel: eventual,
+        // which graphRequest does not send. The manager object is trimmed to
+        // id and displayName below instead.
+        let path: string | null = `/users?$select=${select}&$expand=manager` +
+          `&$top=999${
+            args.filter ? `&$filter=${encodeURIComponent(args.filter)}` : ""
+          }`;
+
+        const raw: Array<Record<string, unknown>> = [];
+        let pages = 0;
+        while (path) {
+          const { status, data } = await graphRequest("GET", path);
+          if (status !== 200) {
+            const err =
+              (data as { error?: { code?: string; message?: string } })
+                ?.error;
+            const detail = `${err?.code ?? ""} ${err?.message ?? ""}`.trim() ||
+              `HTTP ${status}`;
+            throw new Error(`Graph user sweep failed: ${detail}`);
+          }
+          const body = data as {
+            value?: Array<Record<string, unknown>>;
+            "@odata.nextLink"?: string;
+          };
+          raw.push(...(body.value ?? []));
+          pages++;
+          const next = body["@odata.nextLink"];
+          // nextLink is absolute; graphRequest re-applies the v1.0 prefix.
+          path = next
+            ? next.replace("https://graph.microsoft.com/v1.0", "")
+            : null;
+        }
+
+        const users = raw
+          .filter((u) => !args.enabledOnly || u.accountEnabled === true)
+          .filter((u) =>
+            !args.requireJobTitle ||
+            typeof u.jobTitle === "string" && u.jobTitle.trim() !== ""
+          )
+          .map((u) => {
+            const manager = u.manager as
+              | { id?: string; displayName?: string }
+              | null
+              | undefined;
+            const { manager: _dropped, ...rest } = u;
+            return {
+              ...rest,
+              managerId: manager?.id ?? null,
+              managerDisplayName: manager?.displayName ?? null,
+            };
+          });
+
+        const rooted = users.filter((u) => u.managerId === null).length;
+        context.logger.info(
+          "Swept {count} users across {pages} pages; {managed} have a manager, {rooted} have none",
+          {
+            count: users.length,
+            pages,
+            managed: users.length - rooted,
+            rooted,
+          },
+        );
+
+        const handles = [];
+        for (const u of users) {
+          const handle = await context.writeResource(
+            "user",
+            sanitizeInstanceName(u.id as string),
+            u,
+          );
+          handles.push(handle);
+        }
+        return { dataHandles: handles };
       },
     },
 

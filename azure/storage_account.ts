@@ -26,6 +26,43 @@ const StorageAccountSchema = z
   })
   .passthrough();
 
+const ContainerListSchema = z
+  .object({
+    account: z.string(),
+    count: z.number(),
+    containers: z.array(
+      z
+        .object({
+          name: z.string(),
+          publicAccess: z.string().nullable().optional(),
+          lastModified: z.string().optional(),
+        })
+        .passthrough(),
+    ),
+    capturedAt: z.string(),
+  })
+  .passthrough();
+
+const BlobListSchema = z
+  .object({
+    account: z.string(),
+    container: z.string(),
+    count: z.number(),
+    blobs: z.array(
+      z
+        .object({
+          name: z.string(),
+          blobType: z.string().optional(),
+          contentLength: z.number().optional(),
+          contentType: z.string().nullable().optional(),
+          lastModified: z.string().optional(),
+        })
+        .passthrough(),
+    ),
+    capturedAt: z.string(),
+  })
+  .passthrough();
+
 /**
  * `@dougschaefer/azure-storage-account` model — Azure Storage account
  * lifecycle, wrapping the `az storage account` CLI. list enumerates
@@ -35,14 +72,16 @@ const StorageAccountSchema = z
  * network ACLs, and encryption configuration. get and sync return
  * or refresh one account. create provisions a new storage account
  * with the chosen kind/SKU, location, network rules, and TLS floor.
- * delete removes it. Container, blob, file-share, and queue
- * management is intentionally out of scope here — use `az storage
- * blob`, `az storage container`, etc., or extend this model with
- * data-plane methods.
+ * delete removes it. listContainers and listBlobs cover the blob
+ * data plane read path and uploadBlob the write path — installer ISOs
+ * and machine images — all authenticating as the signed-in principal
+ * so no account key is ever handled, which means reads need Storage
+ * Blob Data Reader and uploads need Contributor. File-share and queue
+ * management remain out of scope.
  */
 export const model = {
   type: "@dougschaefer/azure-storage-account",
-  version: "2026.07.28.5",
+  version: "2026.08.04.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     storageAccount: {
@@ -50,6 +89,18 @@ export const model = {
       schema: StorageAccountSchema,
       lifetime: "infinite",
       garbageCollection: 10,
+    },
+    containerList: {
+      description: "Blob containers in one storage account",
+      schema: ContainerListSchema,
+      lifetime: "7d",
+      garbageCollection: 5,
+    },
+    blobList: {
+      description: "Blobs in one container",
+      schema: BlobListSchema,
+      lifetime: "7d",
+      garbageCollection: 5,
     },
   },
   methods: {
@@ -265,6 +316,211 @@ export const model = {
           "storageAccount",
           sanitizeInstanceName(args.name),
           acct,
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    listContainers: {
+      description:
+        "List blob containers in a storage account. Authenticates as the signed-in principal (--auth-mode login), so it needs Storage Blob Data Reader on the account and never touches an account key.",
+      arguments: z.object({
+        name: z.string().describe("Storage account name"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const containers = (await az(
+          [
+            "storage",
+            "container",
+            "list",
+            "--account-name",
+            args.name,
+            "--auth-mode",
+            "login",
+          ],
+          g.subscriptionId,
+        )) as Array<Record<string, unknown>>;
+
+        context.logger.info(
+          "Found {count} containers in {account}",
+          { count: containers.length, account: args.name },
+        );
+
+        const handle = await context.writeResource(
+          "containerList",
+          sanitizeInstanceName(`containers-${args.name}`),
+          {
+            account: args.name,
+            count: containers.length,
+            containers: containers.map((c) => ({
+              name: c.name as string,
+              publicAccess:
+                (c.properties as Record<string, unknown>)?.publicAccess ?? null,
+              lastModified: (c.properties as Record<string, unknown>)
+                ?.lastModified as string | undefined,
+            })),
+            capturedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    listBlobs: {
+      description:
+        "List blobs in one container, with size and content type — enough to identify machine images and their formats. Authenticates as the signed-in principal (--auth-mode login); no account key is handled.",
+      arguments: z.object({
+        name: z.string().describe("Storage account name"),
+        container: z.string().describe("Container name"),
+        prefix: z
+          .string()
+          .optional()
+          .describe("Only list blobs whose names start with this prefix"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const cmdArgs = [
+          "storage",
+          "blob",
+          "list",
+          "--account-name",
+          args.name,
+          "--container-name",
+          args.container,
+          "--auth-mode",
+          "login",
+        ];
+        if (args.prefix) {
+          cmdArgs.push("--prefix", args.prefix);
+        }
+
+        const blobs = (await az(cmdArgs, g.subscriptionId)) as Array<
+          Record<string, unknown>
+        >;
+
+        context.logger.info(
+          "Found {count} blobs in {account}/{container}",
+          {
+            count: blobs.length,
+            account: args.name,
+            container: args.container,
+          },
+        );
+
+        const handle = await context.writeResource(
+          "blobList",
+          sanitizeInstanceName(`blobs-${args.name}-${args.container}`),
+          {
+            account: args.name,
+            container: args.container,
+            count: blobs.length,
+            blobs: blobs.map((b) => {
+              const p = (b.properties ?? {}) as Record<string, unknown>;
+              return {
+                name: b.name as string,
+                blobType: p.blobType as string | undefined,
+                contentLength: p.contentLength as number | undefined,
+                contentType: ((p.contentSettings as Record<string, unknown>)
+                  ?.contentType as string | undefined) ?? null,
+                lastModified: p.lastModified as string | undefined,
+              };
+            }),
+            capturedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    uploadBlob: {
+      description:
+        "Upload a local file into a container — installer ISOs and machine images. Authenticates as the signed-in principal (--auth-mode login), which needs Storage Blob Data Contributor; Reader is not enough to write. Large files are chunked by the CLI, so allow a generous method timeout.",
+      arguments: z.object({
+        name: z.string().describe("Storage account name"),
+        container: z.string().describe("Destination container"),
+        file: z.string().describe("Absolute path to the local file"),
+        blobName: z
+          .string()
+          .optional()
+          .describe("Destination blob name; defaults to the file's basename"),
+        overwrite: z
+          .boolean()
+          .default(false)
+          .describe("Replace an existing blob of the same name"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const blobName = args.blobName ||
+          args.file.split("/").filter(Boolean).pop() as string;
+
+        const cmdArgs = [
+          "storage",
+          "blob",
+          "upload",
+          "--account-name",
+          args.name,
+          "--container-name",
+          args.container,
+          "--file",
+          args.file,
+          "--name",
+          blobName,
+          "--auth-mode",
+          "login",
+        ];
+        if (args.overwrite) {
+          cmdArgs.push("--overwrite", "true");
+        }
+
+        context.logger.info(
+          "Uploading {file} to {account}/{container}/{blob}",
+          {
+            file: args.file,
+            account: args.name,
+            container: args.container,
+            blob: blobName,
+          },
+        );
+
+        await az(cmdArgs, g.subscriptionId);
+
+        // Re-list so the stored blob inventory reflects the new artifact.
+        const blobs = (await az(
+          [
+            "storage",
+            "blob",
+            "list",
+            "--account-name",
+            args.name,
+            "--container-name",
+            args.container,
+            "--auth-mode",
+            "login",
+          ],
+          g.subscriptionId,
+        )) as Array<Record<string, unknown>>;
+
+        const handle = await context.writeResource(
+          "blobList",
+          sanitizeInstanceName(`blobs-${args.name}-${args.container}`),
+          {
+            account: args.name,
+            container: args.container,
+            count: blobs.length,
+            blobs: blobs.map((b) => {
+              const p = (b.properties ?? {}) as Record<string, unknown>;
+              return {
+                name: b.name as string,
+                blobType: p.blobType as string | undefined,
+                contentLength: p.contentLength as number | undefined,
+                contentType: ((p.contentSettings as Record<string, unknown>)
+                  ?.contentType as string | undefined) ?? null,
+                lastModified: p.lastModified as string | undefined,
+              };
+            }),
+            capturedAt: new Date().toISOString(),
+          },
         );
         return { dataHandles: [handle] };
       },

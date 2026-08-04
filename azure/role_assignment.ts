@@ -71,7 +71,7 @@ const DenyAssignmentSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-role-assignment",
-  version: "2026.07.28.5",
+  version: "2026.08.04.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     assignment: {
@@ -183,7 +183,7 @@ export const model = {
           .enum(["User", "Group", "ServicePrincipal"])
           .optional()
           .describe(
-            "Principal type — set when assignee is an object id to skip a Graph lookup",
+            "Principal type — set only when assignee is an object id; it switches the call to --assignee-object-id and skips the Graph lookup",
           ),
       }),
       execute: async (args, context) => {
@@ -195,19 +195,27 @@ export const model = {
             }`
             : `/subscriptions/${g.subscriptionId}`);
 
+        // az rejects --assignee alongside --assignee-principal-type: the
+        // principal-type hint only exists to skip the Graph lookup, so it is
+        // only meaningful with an object id passed as --assignee-object-id.
         const cmdArgs = [
           "role",
           "assignment",
           "create",
-          "--assignee",
-          args.assignee,
           "--role",
           args.role,
           "--scope",
           scope,
         ];
         if (args.assigneePrincipalType) {
-          cmdArgs.push("--assignee-principal-type", args.assigneePrincipalType);
+          cmdArgs.push(
+            "--assignee-object-id",
+            args.assignee,
+            "--assignee-principal-type",
+            args.assigneePrincipalType,
+          );
+        } else {
+          cmdArgs.push("--assignee", args.assignee);
         }
 
         let assignment: Record<string, unknown>;

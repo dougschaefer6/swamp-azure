@@ -52,7 +52,7 @@ const OwnerSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-ad-app-registration",
-  version: "2026.07.28.5",
+  version: "2026.08.04.1",
   globalArguments: EntraGlobalArgsSchema,
   resources: {
     application: {

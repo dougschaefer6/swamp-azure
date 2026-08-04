@@ -26,6 +26,19 @@ function devopsArgs(
   return args;
 }
 
+/**
+ * Build `--org` only, for the organization-scoped commands that reject
+ * `--project` outright (`az devops project list` errors with "unrecognized
+ * arguments" rather than ignoring it). Using {@link devopsArgs} for these
+ * breaks any instance that sets a default project.
+ */
+function orgArgs(
+  baseArgs: string[],
+  g: { organization: string },
+): string[] {
+  return [...baseArgs, "--org", g.organization];
+}
+
 const ProjectSchema = z
   .object({
     id: z.string(),
@@ -153,6 +166,120 @@ const AgentPoolSchema = z
   })
   .passthrough();
 
+const SecurityGroupSchema = z
+  .object({
+    displayName: z.string().optional(),
+    principalName: z.string().optional(),
+    descriptor: z.string().optional(),
+    origin: z.string().optional(),
+    subjectKind: z.string().optional(),
+  })
+  .passthrough();
+
+const GroupRuleSchema = z
+  .object({
+    id: z.string().optional(),
+    displayName: z.string().optional(),
+    principalName: z.string().optional(),
+    origin: z.string().optional(),
+    status: z.string().optional(),
+    accessLevel: z.string().nullable().optional(),
+    projectCount: z.number(),
+    projects: z.array(
+      z.object({
+        id: z.string().optional(),
+        name: z.string().optional(),
+        groupType: z.string().optional(),
+      }).passthrough(),
+    ),
+    capturedAt: z.string(),
+  })
+  .passthrough();
+
+const GroupRuleCoverageSchema = z
+  .object({
+    organization: z.string(),
+    projectCount: z.number(),
+    ruleCount: z.number(),
+    expectedGroupType: z.string(),
+    rules: z.array(
+      z.object({
+        groupId: z.string().optional(),
+        displayName: z.string().optional(),
+        covered: z.number(),
+        missingCount: z.number(),
+        missing: z.array(z.string()),
+      }).passthrough(),
+    ),
+    // Projects absent from EVERY rule — the ones with no default access at all.
+    missingFromAllRules: z.array(z.string()),
+    capturedAt: z.string(),
+  })
+  .passthrough();
+
+const GroupRuleUpdateSchema = z
+  .object({
+    organization: z.string(),
+    dryRun: z.boolean(),
+    groupType: z.string(),
+    results: z.array(
+      z.object({
+        groupId: z.string().optional(),
+        displayName: z.string().optional(),
+        added: z.array(z.string()),
+        alreadyPresent: z.array(z.string()),
+        isSuccess: z.boolean().optional(),
+        status: z.string().optional(),
+        errors: z.array(z.unknown()).optional(),
+      }).passthrough(),
+    ),
+    capturedAt: z.string(),
+  })
+  .passthrough();
+
+/** Azure DevOps' AAD resource id — the audience every ADO REST call needs. */
+const ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798";
+
+/**
+ * Extract the bare organization name from the `organization` global argument,
+ * which is a URL such as `https://dev.azure.com/Contoso`. The entitlement APIs
+ * live on a different host (`vsaex.dev.azure.com`) and address the org by name,
+ * so the URL cannot be reused verbatim.
+ */
+function orgName(organization: string): string {
+  const trimmed = organization.replace(/\/+$/, "");
+  return trimmed.slice(trimmed.lastIndexOf("/") + 1);
+}
+
+/**
+ * Call an Azure DevOps REST endpoint through `az rest`, which reuses the
+ * active `az login` session — no PAT is stored or passed. Used for the
+ * Member Entitlement Management APIs (group rules), which the `az devops`
+ * CLI does not wrap. The body carries project ids and group types only,
+ * never a credential.
+ */
+async function adoRest(
+  method: string,
+  uri: string,
+  body?: unknown,
+  contentType = "application/json",
+): Promise<unknown> {
+  const args = [
+    "rest",
+    "--method",
+    method,
+    "--resource",
+    ADO_RESOURCE,
+    "--uri",
+    uri,
+  ];
+  if (body !== undefined) {
+    args.push("--body", JSON.stringify(body));
+    args.push("--headers", `Content-Type=${contentType}`);
+  }
+  return await az(args, undefined);
+}
+
 /**
  * `@dougschaefer/azure-devops` model — Azure DevOps Services
  * automation, wrapping the `az devops` and `az pipelines` /
@@ -172,13 +299,25 @@ const AgentPoolSchema = z
  * (listVariableGroups, getVariableGroup) read pipeline variable
  * groups; pull-request methods (listPullRequests, getPullRequest)
  * read PRs across a project or one repository; listAgentPools reads
- * the organization-level agent pools. Used by CI/CD workflows that
- * bootstrap repos, trigger publish pipelines, and create tracking
- * tickets — mutations touch production project state.
+ * the organization-level agent pools. Access methods cover the way
+ * Azure DevOps actually grants default project membership: group
+ * rules. listSecurityGroups reads the group inventory at project or
+ * organization scope; listGroupRules reads each rule with the
+ * projects it entitles; auditGroupRuleCoverage is the fan-out
+ * reconciliation read, comparing every project against every rule in
+ * one execution to find projects no rule covers; and
+ * addProjectsToGroupRules closes those gaps. Group rules enumerate
+ * their projects explicitly and have no wildcard, so a project
+ * created after a rule was written is silently outside it until
+ * something adds it — which is the drift these two methods exist to
+ * detect and repair. Used by CI/CD workflows that bootstrap repos,
+ * trigger publish pipelines, and create tracking tickets — mutations
+ * touch production project state and, for the access methods,
+ * production permissions.
  */
 export const model = {
   type: "@dougschaefer/azure-devops",
-  version: "2026.07.28.5",
+  version: "2026.08.04.1",
   globalArguments: DevOpsGlobalArgsSchema,
   resources: {
     project: {
@@ -236,6 +375,34 @@ export const model = {
       lifetime: "infinite",
       garbageCollection: 10,
     },
+    securityGroup: {
+      description:
+        "Azure DevOps security group (project or organization scope)",
+      schema: SecurityGroupSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    groupRule: {
+      description:
+        "Azure DevOps group rule (group entitlement) and the projects it grants membership in",
+      schema: GroupRuleSchema,
+      lifetime: "30d",
+      garbageCollection: 10,
+    },
+    groupRuleCoverage: {
+      description:
+        "Which projects each group rule covers, and which projects no rule covers at all",
+      schema: GroupRuleCoverageSchema,
+      lifetime: "30d",
+      garbageCollection: 10,
+    },
+    groupRuleUpdate: {
+      description:
+        "Result of adding projects to group rules: what was added, what was already present",
+      schema: GroupRuleUpdateSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
     agentPool: {
       description: "Azure DevOps organization agent pool",
       schema: AgentPoolSchema,
@@ -250,7 +417,7 @@ export const model = {
       execute: async (_args, context) => {
         const g = context.globalArgs;
         const result = (await az(
-          devopsArgs(["devops", "project", "list"], g),
+          orgArgs(["devops", "project", "list"], g),
           undefined,
         )) as Record<string, unknown>;
 
@@ -1205,6 +1372,406 @@ export const model = {
           handles.push(handle);
         }
         return { dataHandles: handles };
+      },
+    },
+
+    listSecurityGroups: {
+      description:
+        "List Azure DevOps security groups. Scoped to one project by default, or to the whole organization with scope=organization. Reading group membership is how you verify effective access, which can differ from what the group rules declare when someone adds a group to a project by hand.",
+      arguments: z.object({
+        project: z
+          .string()
+          .optional()
+          .describe("Project to scope to; omit with scope=organization"),
+        scope: z
+          .enum(["project", "organization"])
+          .optional()
+          .describe("Group scope to list (default project)"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const baseArgs = ["devops", "security", "group", "list"];
+        const cmdArgs = args.scope === "organization"
+          ? [...baseArgs, "--org", g.organization, "--scope", "organization"]
+          : devopsArgs(baseArgs, g, args.project);
+
+        const result = (await az(cmdArgs, undefined)) as Record<
+          string,
+          unknown
+        >;
+        const groups = ((result?.graphGroups ?? result?.value ?? result) ??
+          []) as Array<Record<string, unknown>>;
+
+        context.logger.info("Found {count} security groups in scope {scope}", {
+          count: groups.length,
+          scope: args.scope ?? "project",
+        });
+
+        const handles = [];
+        for (const grp of groups) {
+          const key = (grp.principalName ?? grp.descriptor ??
+            grp.displayName) as string;
+          const handle = await context.writeResource(
+            "securityGroup",
+            sanitizeInstanceName(key),
+            grp,
+          );
+          handles.push(handle);
+        }
+        return { dataHandles: handles };
+      },
+    },
+
+    listGroupRules: {
+      description:
+        "List the organization's group rules (group entitlements) and the projects each one grants membership in. A group rule is how Azure DevOps assigns an access level and project membership to everyone in a Microsoft Entra or Azure DevOps group. Requires Project Collection Administrator.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const org = orgName(g.organization);
+        const body = (await adoRest(
+          "get",
+          `https://vsaex.dev.azure.com/${org}/_apis/groupentitlements?api-version=7.1-preview.1`,
+        )) as Record<string, unknown>;
+
+        const rules = ((body?.members ?? body?.value ?? []) ?? []) as Array<
+          Record<string, unknown>
+        >;
+        const capturedAt = new Date().toISOString();
+
+        const handles = [];
+        for (const r of rules) {
+          const grp = (r.group ?? {}) as Record<string, unknown>;
+          const pes = (r.projectEntitlements ?? []) as Array<
+            Record<string, unknown>
+          >;
+          const projects = pes.map((pe) => {
+            const ref = (pe.projectRef ?? {}) as Record<string, unknown>;
+            const pg = (pe.group ?? {}) as Record<string, unknown>;
+            return {
+              id: ref.id as string | undefined,
+              name: ref.name as string | undefined,
+              groupType: pg.groupType as string | undefined,
+            };
+          });
+
+          const handle = await context.writeResource(
+            "groupRule",
+            sanitizeInstanceName(
+              (grp.displayName as string) ?? (r.id as string),
+            ),
+            {
+              id: r.id,
+              displayName: grp.displayName,
+              principalName: grp.principalName,
+              origin: grp.origin,
+              status: r.status,
+              accessLevel: ((r.licenseRule ?? {}) as Record<string, unknown>)
+                .licenseDisplayName ?? null,
+              projectCount: projects.length,
+              projects,
+              capturedAt,
+            },
+          );
+          handles.push(handle);
+        }
+
+        context.logger.info("Found {count} group rules", {
+          count: rules.length,
+        });
+        return { dataHandles: handles };
+      },
+    },
+
+    auditGroupRuleCoverage: {
+      description:
+        "Compare every project in the organization against every group rule in one sweep and report which projects each rule is missing. Group rules list their projects explicitly and have no wildcard, so any project created after a rule was written falls outside it silently — this is the read that surfaces that drift. Read-only; pair it with addProjectsToGroupRules to close what it finds.",
+      arguments: z.object({
+        groupNames: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Restrict the audit to these group rule display names (default all rules)",
+          ),
+        expectedGroupType: z
+          .string()
+          .optional()
+          .describe(
+            "Project group callers expect each rule to grant, recorded on the output for reference (default projectContributor)",
+          ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const org = orgName(g.organization);
+        const expectedGroupType = args.expectedGroupType ??
+          "projectContributor";
+
+        const projResult = (await az(
+          orgArgs(["devops", "project", "list"], g),
+          undefined,
+        )) as Record<string, unknown>;
+        const projects = ((projResult?.value ?? projResult) ?? []) as Array<
+          Record<string, unknown>
+        >;
+        const allNames = projects.map((p) => p.name as string);
+
+        const body = (await adoRest(
+          "get",
+          `https://vsaex.dev.azure.com/${org}/_apis/groupentitlements?api-version=7.1-preview.1`,
+        )) as Record<string, unknown>;
+        let rules = ((body?.members ?? body?.value ?? []) ?? []) as Array<
+          Record<string, unknown>
+        >;
+        if (args.groupNames?.length) {
+          const want = new Set(args.groupNames);
+          rules = rules.filter((r) =>
+            want.has(
+              ((r.group ?? {}) as Record<string, unknown>)
+                .displayName as string,
+            )
+          );
+        }
+
+        const missingCounts = new Map<string, number>();
+        const ruleRows = rules.map((r) => {
+          const grp = (r.group ?? {}) as Record<string, unknown>;
+          const pes = (r.projectEntitlements ?? []) as Array<
+            Record<string, unknown>
+          >;
+          const covered = new Set(
+            pes.map((pe) =>
+              ((pe.projectRef ?? {}) as Record<string, unknown>).name as string
+            ),
+          );
+          const missing = allNames.filter((n) => !covered.has(n)).sort();
+          for (const m of missing) {
+            missingCounts.set(m, (missingCounts.get(m) ?? 0) + 1);
+          }
+          return {
+            groupId: r.id as string | undefined,
+            displayName: grp.displayName as string | undefined,
+            covered: covered.size,
+            missingCount: missing.length,
+            missing,
+          };
+        });
+
+        // A project absent from every rule has no default access at all —
+        // that is the population a user would report as "locked out".
+        const missingFromAllRules = rules.length > 0
+          ? allNames
+            .filter((n) => (missingCounts.get(n) ?? 0) === rules.length)
+            .sort()
+          : [];
+
+        context.logger.info(
+          "Audited {projects} projects against {rules} rules; {orphans} project(s) covered by no rule",
+          {
+            projects: allNames.length,
+            rules: rules.length,
+            orphans: missingFromAllRules.length,
+          },
+        );
+
+        const handle = await context.writeResource(
+          "groupRuleCoverage",
+          sanitizeInstanceName(`coverage-${org}`),
+          {
+            organization: org,
+            projectCount: allNames.length,
+            ruleCount: rules.length,
+            expectedGroupType,
+            rules: ruleRows,
+            missingFromAllRules,
+            capturedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    addProjectsToGroupRules: {
+      description:
+        "Add projects to one or more group rules in a single fan-out execution, granting every member of those groups membership in those projects. Strictly additive: a project already entitled is left untouched, so existing per-project group types (including custom ones) are never rewritten. dryRun defaults to true and routes through the API's own testApplyGroupRule mode, which validates without changing anything. Requires Project Collection Administrator; mutates production permissions.",
+      arguments: z.object({
+        groupNames: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Group rule display names to update (default every rule in the organization)",
+          ),
+        projects: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Project names to add (default every project the rule is missing)",
+          ),
+        groupType: z
+          .string()
+          .optional()
+          .describe(
+            "Project group to grant: projectReader, projectContributor, projectAdministrator, or projectStakeholder (default projectContributor)",
+          ),
+        dryRun: z
+          .boolean()
+          .optional()
+          .describe(
+            "Validate through testApplyGroupRule without persisting (default true)",
+          ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const org = orgName(g.organization);
+        const groupType = args.groupType ?? "projectContributor";
+        const dryRun = args.dryRun ?? true;
+
+        const projResult = (await az(
+          orgArgs(["devops", "project", "list"], g),
+          undefined,
+        )) as Record<string, unknown>;
+        const projects = ((projResult?.value ?? projResult) ?? []) as Array<
+          Record<string, unknown>
+        >;
+        const idByName = new Map(
+          projects.map((p) => [p.name as string, p.id as string]),
+        );
+
+        if (args.projects?.length) {
+          const unknown = args.projects.filter((p) => !idByName.has(p));
+          if (unknown.length) {
+            throw new Error(
+              `Unknown project(s): ${unknown.join(", ")}`,
+            );
+          }
+        }
+
+        const body = (await adoRest(
+          "get",
+          `https://vsaex.dev.azure.com/${org}/_apis/groupentitlements?api-version=7.1-preview.1`,
+        )) as Record<string, unknown>;
+        let rules = ((body?.members ?? body?.value ?? []) ?? []) as Array<
+          Record<string, unknown>
+        >;
+        if (args.groupNames?.length) {
+          const want = new Set(args.groupNames);
+          rules = rules.filter((r) =>
+            want.has(
+              ((r.group ?? {}) as Record<string, unknown>)
+                .displayName as string,
+            )
+          );
+          if (rules.length !== args.groupNames.length) {
+            const found = new Set(
+              rules.map((r) =>
+                ((r.group ?? {}) as Record<string, unknown>)
+                  .displayName as string
+              ),
+            );
+            throw new Error(
+              `Group rule(s) not found: ${
+                args.groupNames.filter((n) => !found.has(n)).join(", ")
+              }`,
+            );
+          }
+        }
+
+        const ruleOption = dryRun ? "testApplyGroupRule" : "applyGroupRule";
+        const results = [];
+
+        for (const r of rules) {
+          const grp = (r.group ?? {}) as Record<string, unknown>;
+          const displayName = grp.displayName as string | undefined;
+          const pes = (r.projectEntitlements ?? []) as Array<
+            Record<string, unknown>
+          >;
+          const covered = new Set(
+            pes.map((pe) =>
+              ((pe.projectRef ?? {}) as Record<string, unknown>).name as string
+            ),
+          );
+
+          const candidates = args.projects?.length
+            ? args.projects
+            : [...idByName.keys()];
+          const toAdd = candidates.filter((n) => !covered.has(n)).sort();
+          const alreadyPresent = candidates.filter((n) => covered.has(n))
+            .sort();
+
+          if (toAdd.length === 0) {
+            context.logger.info(
+              "Rule {rule}: nothing to add, all {count} requested project(s) already entitled",
+              { rule: displayName, count: alreadyPresent.length },
+            );
+            results.push({
+              groupId: r.id as string | undefined,
+              displayName,
+              added: [],
+              alreadyPresent,
+              isSuccess: true,
+              status: "noop",
+            });
+            continue;
+          }
+
+          const patch = toAdd.map((name) => ({
+            from: "",
+            op: "add",
+            path: "/projectEntitlements",
+            value: {
+              projectRef: { id: idByName.get(name) },
+              group: { groupType },
+            },
+          }));
+
+          const resp = (await adoRest(
+            "patch",
+            `https://vsaex.dev.azure.com/${org}/_apis/groupentitlements/${r.id}` +
+              `?ruleOption=${ruleOption}&api-version=7.1-preview.1`,
+            patch,
+            "application/json-patch+json",
+          )) as Record<string, unknown>;
+
+          const errors = ((resp?.results ?? []) as Array<
+            Record<string, unknown>
+          >)
+            .flatMap((x) => (x.errors ?? []) as Array<unknown>);
+
+          context.logger.info(
+            "Rule {rule}: {action} {count} project(s) as {groupType}{errs}",
+            {
+              rule: displayName,
+              action: dryRun ? "would add" : "added",
+              count: toAdd.length,
+              groupType,
+              errs: errors.length ? ` (${errors.length} error(s))` : "",
+            },
+          );
+
+          results.push({
+            groupId: r.id as string | undefined,
+            displayName,
+            added: toAdd,
+            alreadyPresent,
+            isSuccess: resp?.haveResultsSucceeded as boolean | undefined,
+            status: resp?.status as string | undefined,
+            errors,
+          });
+        }
+
+        const handle = await context.writeResource(
+          "groupRuleUpdate",
+          sanitizeInstanceName(
+            `rule-update-${org}-${dryRun ? "dryrun" : "applied"}`,
+          ),
+          {
+            organization: org,
+            dryRun,
+            groupType,
+            results,
+            capturedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
       },
     },
   },
