@@ -75,7 +75,7 @@ const FirewallPolicySchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-firewall",
-  version: "2026.08.04.1",
+  version: "2026.08.04.2",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     firewall: {

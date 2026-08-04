@@ -85,7 +85,7 @@ function escapeLabel(s: string): string {
  */
 export const model = {
   type: "@dougschaefer/azure-topology",
-  version: "2026.08.04.1",
+  version: "2026.08.04.2",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     topology: {

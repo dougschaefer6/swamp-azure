@@ -50,7 +50,7 @@ const FederatedCredentialSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-managed-identity",
-  version: "2026.08.04.1",
+  version: "2026.08.04.2",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     identity: {

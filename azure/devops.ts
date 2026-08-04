@@ -217,6 +217,23 @@ const GroupRuleCoverageSchema = z
   })
   .passthrough();
 
+const UserEntitlementUpdateSchema = z
+  .object({
+    organization: z.string(),
+    user: z.string(),
+    userId: z.string().optional(),
+    dryRun: z.boolean(),
+    groupType: z.string(),
+    mirroredFrom: z.string().nullable().optional(),
+    added: z.array(z.string()),
+    alreadyPresent: z.array(z.string()),
+    isSuccess: z.boolean().optional(),
+    status: z.string().optional(),
+    errors: z.array(z.unknown()).optional(),
+    capturedAt: z.string(),
+  })
+  .passthrough();
+
 const GroupRuleUpdateSchema = z
   .object({
     organization: z.string(),
@@ -239,6 +256,23 @@ const GroupRuleUpdateSchema = z
 
 /** Azure DevOps' AAD resource id — the audience every ADO REST call needs. */
 const ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798";
+
+/**
+ * Entitlement PATCH bodies are capped server-side: more than 50 JSON Patch
+ * operations in one request fails with "There can not be more than 50
+ * operations processed." Mirroring a group rule onto a user routinely exceeds
+ * that, so every patch is split into batches of this size.
+ */
+const MAX_PATCH_OPS = 50;
+
+/** Split an array into consecutive chunks of at most `size`. */
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
+}
 
 /**
  * Extract the bare organization name from the `organization` global argument,
@@ -317,7 +351,7 @@ async function adoRest(
  */
 export const model = {
   type: "@dougschaefer/azure-devops",
-  version: "2026.08.04.1",
+  version: "2026.08.04.2",
   globalArguments: DevOpsGlobalArgsSchema,
   resources: {
     project: {
@@ -400,6 +434,13 @@ export const model = {
       description:
         "Result of adding projects to group rules: what was added, what was already present",
       schema: GroupRuleUpdateSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    userEntitlementUpdate: {
+      description:
+        "Result of granting one user project membership directly, outside any group rule",
+      schema: UserEntitlementUpdateSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -1713,28 +1754,33 @@ export const model = {
             continue;
           }
 
-          const patch = toAdd.map((name) => ({
-            from: "",
-            op: "add",
-            path: "/projectEntitlements",
-            value: {
-              projectRef: { id: idByName.get(name) },
-              group: { groupType },
-            },
-          }));
+          // Batched: the entitlement API rejects more than 50 ops per request.
+          let resp: Record<string, unknown> = {};
+          let errors: unknown[] = [];
+          for (const batch of chunk(toAdd, MAX_PATCH_OPS)) {
+            const patch = batch.map((name) => ({
+              from: "",
+              op: "add",
+              path: "/projectEntitlements",
+              value: {
+                projectRef: { id: idByName.get(name) },
+                group: { groupType },
+              },
+            }));
 
-          const resp = (await adoRest(
-            "patch",
-            `https://vsaex.dev.azure.com/${org}/_apis/groupentitlements/${r.id}` +
-              `?ruleOption=${ruleOption}&api-version=7.1-preview.1`,
-            patch,
-            "application/json-patch+json",
-          )) as Record<string, unknown>;
+            resp = (await adoRest(
+              "patch",
+              `https://vsaex.dev.azure.com/${org}/_apis/groupentitlements/${r.id}` +
+                `?ruleOption=${ruleOption}&api-version=7.1-preview.1`,
+              patch,
+              "application/json-patch+json",
+            )) as Record<string, unknown>;
 
-          const errors = ((resp?.results ?? []) as Array<
-            Record<string, unknown>
-          >)
-            .flatMap((x) => (x.errors ?? []) as Array<unknown>);
+            errors = errors.concat(
+              ((resp?.results ?? []) as Array<Record<string, unknown>>)
+                .flatMap((x) => (x.errors ?? []) as Array<unknown>),
+            );
+          }
 
           context.logger.info(
             "Rule {rule}: {action} {count} project(s) as {groupType}{errs}",
@@ -1768,6 +1814,196 @@ export const model = {
             dryRun,
             groupType,
             results,
+            capturedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    addProjectsToUserEntitlement: {
+      description:
+        "Grant one user project membership directly, without routing through a group rule. Use mirrorGroupRule to copy the exact project set a group rule already grants, which is how you give someone a group's access when they cannot be placed in the backing directory group yet. Strictly additive: projects the user already holds are left untouched. Unlike the group-rule methods there is no server-side test mode on this endpoint, so dryRun (default true) reports the plan without calling the API at all. Requires Project Collection Administrator; mutates production permissions.",
+      arguments: z.object({
+        user: z
+          .string()
+          .describe("User principal name or entitlement id to grant access to"),
+        mirrorGroupRule: z
+          .string()
+          .optional()
+          .describe(
+            "Copy the project set from this group rule's display name, e.g. Field Engineering Department",
+          ),
+        projects: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Explicit project names to grant; ignored when mirrorGroupRule is set",
+          ),
+        groupType: z
+          .string()
+          .optional()
+          .describe(
+            "Project group to grant: projectReader, projectContributor, projectAdministrator, or projectStakeholder (default projectContributor)",
+          ),
+        dryRun: z
+          .boolean()
+          .optional()
+          .describe("Report the plan without calling the API (default true)"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const org = orgName(g.organization);
+        const groupType = args.groupType ?? "projectContributor";
+        const dryRun = args.dryRun ?? true;
+        const base = `https://vsaex.dev.azure.com/${org}/_apis`;
+
+        const found = (await adoRest(
+          "get",
+          `${base}/userentitlements?$filter=${
+            encodeURIComponent(`name eq '${args.user}'`)
+          }&api-version=7.1-preview.3`,
+        )) as Record<string, unknown>;
+        const matches = ((found?.members ?? found?.value ?? []) ?? []) as Array<
+          Record<string, unknown>
+        >;
+        if (matches.length !== 1) {
+          throw new Error(
+            `Expected exactly one entitlement for "${args.user}", found ${matches.length}. The user must already exist in the organization.`,
+          );
+        }
+        const userId = matches[0].id as string;
+
+        // The $filter LIST endpoint omits projectEntitlements entirely — it
+        // always reports an empty array, which would make every project look
+        // unheld and re-send the whole set on each run. Only the per-user
+        // detail endpoint returns them, so current state must be read there.
+        const detail = (await adoRest(
+          "get",
+          `${base}/userentitlements/${userId}?api-version=7.1-preview.3`,
+        )) as Record<string, unknown>;
+        const held = new Set(
+          ((detail?.projectEntitlements ?? []) as Array<
+            Record<string, unknown>
+          >).map((pe) =>
+            ((pe.projectRef ?? {}) as Record<string, unknown>).name as string
+          ),
+        );
+
+        const projResult = (await az(
+          orgArgs(["devops", "project", "list"], g),
+          undefined,
+        )) as Record<string, unknown>;
+        const idByName = new Map(
+          (((projResult?.value ?? projResult) ?? []) as Array<
+            Record<string, unknown>
+          >).map((p) => [p.name as string, p.id as string]),
+        );
+
+        let wanted: string[];
+        if (args.mirrorGroupRule) {
+          const body = (await adoRest(
+            "get",
+            `${base}/groupentitlements?api-version=7.1-preview.1`,
+          )) as Record<string, unknown>;
+          const rules = ((body?.members ?? body?.value ?? []) ?? []) as Array<
+            Record<string, unknown>
+          >;
+          const rule = rules.find((r) =>
+            ((r.group ?? {}) as Record<string, unknown>).displayName ===
+              args.mirrorGroupRule
+          );
+          if (!rule) {
+            throw new Error(`Group rule not found: ${args.mirrorGroupRule}`);
+          }
+          wanted = ((rule.projectEntitlements ?? []) as Array<
+            Record<string, unknown>
+          >).map((pe) =>
+            ((pe.projectRef ?? {}) as Record<string, unknown>).name as string
+          );
+        } else if (args.projects?.length) {
+          wanted = args.projects;
+        } else {
+          throw new Error("Supply either mirrorGroupRule or projects.");
+        }
+
+        const unknown = wanted.filter((n) => !idByName.has(n));
+        if (unknown.length) {
+          throw new Error(`Unknown project(s): ${unknown.join(", ")}`);
+        }
+
+        const toAdd = wanted.filter((n) => !held.has(n)).sort();
+        const alreadyPresent = wanted.filter((n) => held.has(n)).sort();
+
+        let status: string | undefined;
+        let isSuccess: boolean | undefined = true;
+        let errors: unknown[] = [];
+
+        if (toAdd.length === 0) {
+          status = "noop";
+        } else if (dryRun) {
+          status = "dryRun";
+        } else {
+          const batches = chunk(toAdd, MAX_PATCH_OPS);
+          for (const [i, batch] of batches.entries()) {
+            const patch = batch.map((name) => ({
+              from: "",
+              op: "add",
+              path: "/projectEntitlements",
+              value: {
+                projectRef: { id: idByName.get(name) },
+                group: { groupType },
+              },
+            }));
+            const resp = (await adoRest(
+              "patch",
+              `${base}/userentitlements/${userId}?api-version=7.1-preview.3`,
+              patch,
+              "application/json-patch+json",
+            )) as Record<string, unknown>;
+            const ok = resp?.isSuccess as boolean | undefined ??
+              resp?.haveResultsSucceeded as boolean | undefined;
+            if (ok === false) isSuccess = false;
+            status = (resp?.status as string | undefined) ?? "applied";
+            errors = errors.concat(
+              ((resp?.results ?? []) as Array<Record<string, unknown>>)
+                .flatMap((x) => (x.errors ?? []) as Array<unknown>),
+            );
+            context.logger.info(
+              "Batch {n}/{total}: {count} operation(s), success={ok}",
+              { n: i + 1, total: batches.length, count: batch.length, ok },
+            );
+          }
+        }
+
+        context.logger.info(
+          "User {user}: {action} {count} project(s) as {groupType}; {held} already held",
+          {
+            user: args.user,
+            action: dryRun ? "would grant" : "granted",
+            count: toAdd.length,
+            groupType,
+            held: alreadyPresent.length,
+          },
+        );
+
+        const handle = await context.writeResource(
+          "userEntitlementUpdate",
+          sanitizeInstanceName(
+            `user-grant-${args.user}-${dryRun ? "dryrun" : "applied"}`,
+          ),
+          {
+            organization: org,
+            user: args.user,
+            userId,
+            dryRun,
+            groupType,
+            mirroredFrom: args.mirrorGroupRule ?? null,
+            added: toAdd,
+            alreadyPresent,
+            isSuccess,
+            status,
+            errors,
             capturedAt: new Date().toISOString(),
           },
         );
