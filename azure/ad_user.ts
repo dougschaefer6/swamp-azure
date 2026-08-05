@@ -50,6 +50,26 @@ const MembershipSchema = z
   })
   .passthrough();
 
+const RoleAuditSchema = z
+  .object({
+    id: z.string(),
+    userPrincipalName: z.string().nullish(),
+    displayName: z.string().nullish(),
+    accountEnabled: z.boolean().nullish(),
+    directRoles: z.array(z.string()),
+    // Roles reached through a group that itself holds a role assignment. A
+    // roleAssignments query filtered by principalId never returns these.
+    inheritedRoles: z.array(
+      z.object({
+        role: z.string(),
+        viaGroupId: z.string(),
+        viaGroupName: z.string().nullish(),
+      }),
+    ),
+    effectiveRoles: z.array(z.string()),
+  })
+  .passthrough();
+
 /**
  * `@dougschaefer/azure-ad-user` model — Entra ID (Azure AD) user
  * directory reads, wrapping the `az ad user` CLI. This model is
@@ -77,7 +97,7 @@ const MembershipSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-ad-user",
-  version: "2026.08.04.2",
+  version: "2026.08.05.1",
   globalArguments: EntraGlobalArgsSchema,
   resources: {
     user: {
@@ -89,6 +109,13 @@ export const model = {
     membership: {
       description: "Group a user is a member of",
       schema: MembershipSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    roleAudit: {
+      description:
+        "Effective directory roles for one principal, direct and group-derived",
+      schema: RoleAuditSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -389,6 +416,158 @@ export const model = {
 
         // Persist nothing: no user information is kept inside the model.
         return { dataHandles: [] };
+      },
+    },
+
+    auditDirectoryRoles: {
+      description:
+        "Resolve the effective directory roles held by one or more principals — direct assignments plus roles inherited through group membership — in a single pass. A roleAssignments query filtered by principalId returns only direct grants, so a privilege audit that stops there silently misses every role a user holds via a role-assignable group. Fans out over all supplied principals against one cached tenant-wide assignment sweep.",
+      arguments: z.object({
+        ids: z
+          .array(z.string())
+          .min(1)
+          .describe("User principal names or object ids to audit"),
+      }),
+      execute: async (args, context) => {
+        // One tenant-wide sweep, reused for every principal. Filtering per
+        // principal would cost a round trip each and still miss group-derived
+        // roles, which is the whole point of this method.
+        const assignments: Array<{ principalId: string; role: string }> = [];
+        let path: string | null =
+          "/roleManagement/directory/roleAssignments?$expand=roleDefinition&$top=999";
+        while (path) {
+          const { status, data } = await graphRequest("GET", path);
+          if (status !== 200) {
+            const err =
+              (data as { error?: { code?: string; message?: string } })?.error;
+            const detail = `${err?.code ?? ""} ${err?.message ?? ""}`.trim() ||
+              `HTTP ${status}`;
+            throw new Error(`Directory role sweep failed: ${detail}`);
+          }
+          const body = data as {
+            value?: Array<
+              {
+                principalId?: string;
+                roleDefinition?: { displayName?: string };
+              }
+            >;
+            "@odata.nextLink"?: string;
+          };
+          for (const a of body.value ?? []) {
+            if (a.principalId && a.roleDefinition?.displayName) {
+              assignments.push({
+                principalId: a.principalId,
+                role: a.roleDefinition.displayName,
+              });
+            }
+          }
+          const next = body["@odata.nextLink"];
+          path = next
+            ? next.replace("https://graph.microsoft.com/v1.0", "")
+            : null;
+        }
+
+        const byPrincipal = new Map<string, string[]>();
+        for (const a of assignments) {
+          const list = byPrincipal.get(a.principalId) ?? [];
+          list.push(a.role);
+          byPrincipal.set(a.principalId, list);
+        }
+
+        context.logger.info(
+          "Swept {count} directory role assignments across {principals} principals",
+          { count: assignments.length, principals: byPrincipal.size },
+        );
+
+        const handles = [];
+        for (const ident of args.ids) {
+          const userRes = await graphRequest(
+            "GET",
+            `/users/${encodeURIComponent(ident)}` +
+              `?$select=id,userPrincipalName,displayName,accountEnabled`,
+          );
+          if (userRes.status !== 200) {
+            throw new Error(
+              `Could not resolve principal '${ident}': HTTP ${userRes.status}`,
+            );
+          }
+          const user = userRes.data as {
+            id: string;
+            userPrincipalName?: string;
+            displayName?: string;
+            accountEnabled?: boolean;
+          };
+
+          const directRoles = (byPrincipal.get(user.id) ?? []).sort();
+
+          // Group-derived roles: any group in the transitive closure that
+          // itself holds a role assignment passes that role to the member.
+          const inheritedRoles: Array<
+            { role: string; viaGroupId: string; viaGroupName?: string | null }
+          > = [];
+          let gpath: string | null =
+            `/users/${user.id}/transitiveMemberOf?$top=999`;
+          while (gpath) {
+            const { status, data } = await graphRequest("GET", gpath);
+            if (status !== 200) break;
+            const body = data as {
+              value?: Array<
+                {
+                  id?: string;
+                  displayName?: string;
+                  "@odata.type"?: string;
+                }
+              >;
+              "@odata.nextLink"?: string;
+            };
+            for (const obj of body.value ?? []) {
+              if (obj["@odata.type"] !== "#microsoft.graph.group") continue;
+              if (!obj.id) continue;
+              for (const role of byPrincipal.get(obj.id) ?? []) {
+                inheritedRoles.push({
+                  role,
+                  viaGroupId: obj.id,
+                  viaGroupName: obj.displayName,
+                });
+              }
+            }
+            const next = body["@odata.nextLink"];
+            gpath = next
+              ? next.replace("https://graph.microsoft.com/v1.0", "")
+              : null;
+          }
+
+          const effectiveRoles = [
+            ...new Set([...directRoles, ...inheritedRoles.map((r) => r.role)]),
+          ].sort();
+
+          context.logger.info(
+            "{upn}: {direct} direct, {inherited} inherited, {effective} effective roles",
+            {
+              upn: user.userPrincipalName ?? user.id,
+              direct: directRoles.length,
+              inherited: inheritedRoles.length,
+              effective: effectiveRoles.length,
+            },
+          );
+
+          const handle = await context.writeResource(
+            "roleAudit",
+            sanitizeInstanceName(user.id),
+            {
+              id: user.id,
+              userPrincipalName: user.userPrincipalName,
+              displayName: user.displayName,
+              accountEnabled: user.accountEnabled,
+              directRoles,
+              inheritedRoles,
+              effectiveRoles,
+            },
+          );
+          handles.push(handle);
+        }
+
+        return { dataHandles: handles };
       },
     },
   },

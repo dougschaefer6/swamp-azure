@@ -39,7 +39,7 @@ const SEARCH_API_VERSION = "2023-11-01";
  */
 export const model = {
   type: "@dougschaefer/azure-ai-search",
-  version: "2026.08.04.2",
+  version: "2026.08.05.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     service: {

@@ -87,7 +87,7 @@ const ProtectionResultSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-recovery-services-vault",
-  version: "2026.08.04.2",
+  version: "2026.08.05.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     vault: {

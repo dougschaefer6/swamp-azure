@@ -50,7 +50,7 @@ const CosmosContainerSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-cosmos",
-  version: "2026.08.04.2",
+  version: "2026.08.05.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     account: {

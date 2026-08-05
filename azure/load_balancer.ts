@@ -76,7 +76,7 @@ const ProbeSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-load-balancer",
-  version: "2026.08.04.2",
+  version: "2026.08.05.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     loadBalancer: {
