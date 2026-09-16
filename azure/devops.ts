@@ -119,6 +119,98 @@ const RollupSchema = z
   })
   .passthrough();
 
+const ProjectMembersSchema = z
+  .object({
+    project: z.string(),
+    group: z.string(),
+    capturedAt: z.string(),
+    count: z.number(),
+    members: z.array(
+      z.object({
+        displayName: z.string(),
+        email: z.string(),
+        descriptor: z.string(),
+        via: z.string().describe(
+          "The group the person was found in — the named group itself or a group nested inside it",
+        ),
+      }),
+    ),
+  })
+  .passthrough();
+
+const GroupMembershipSchema = z
+  .object({
+    project: z.string(),
+    group: z.string(),
+    user: z.string(),
+    outcome: z.enum(["added", "already-member"]),
+    appliedAt: z.string(),
+  })
+  .passthrough();
+
+const WorkItemPlanSchema = z
+  .object({
+    project: z.string(),
+    dryRun: z.boolean(),
+    scanned: z.number(),
+    editableCreators: z.array(z.string()),
+    results: z.array(
+      z.object({
+        op: z.enum(["create", "move", "update"]),
+        key: z.string().optional(),
+        id: z.number().optional(),
+        type: z.string().optional(),
+        title: z.string().optional(),
+        parent: z.number().optional(),
+        outcome: z.enum([
+          "created",
+          "moved",
+          "updated",
+          "exists",
+          "unchanged",
+          "planned",
+          "refused",
+          "failed",
+        ]),
+        reason: z.string().optional(),
+        refusedLinks: z.array(z.string()).optional(),
+        stateFrom: z.string().optional(),
+        stateTo: z.string().optional(),
+        assignedFrom: z.string().optional().describe(
+          "Assignee before the update (display name), absent when unassigned",
+        ),
+        assignedTo: z.string().optional().describe(
+          "Assignee the update sets; empty string means unassigned",
+        ),
+        commentsAdded: z.number().optional(),
+        commentsAlreadyPresent: z.number().optional(),
+      }),
+    ),
+  })
+  .passthrough();
+
+const WorkItemSnapshotSchema = z
+  .object({
+    project: z.string(),
+    capturedAt: z.string(),
+    count: z.number(),
+    items: z.array(
+      z.object({
+        id: z.number(),
+        type: z.string(),
+        title: z.string(),
+        state: z.string(),
+        parent: z.number().optional(),
+        createdBy: z.string().optional(),
+        createdByEmail: z.string().optional(),
+        assignedTo: z.string().optional(),
+        assignedToEmail: z.string().optional(),
+        tags: z.string().optional(),
+      }),
+    ),
+  })
+  .passthrough();
+
 const ServiceConnectionSchema = z
   .object({
     id: z.string(),
@@ -325,14 +417,15 @@ async function adoRest(
  * getBuild) cover YAML and classic build/release definitions and the
  * builds they produce. Work-item methods (listWorkItems, getWorkItem,
  * createWorkItem, updateWorkItem) drive Boards items via WIQL and
- * direct field updates; rollupParentStates sweeps a project and
+ * direct field updates; applyWorkItemPlan creates and re-parents
+ * items in one sweep behind an authorship guard; rollupParentStates sweeps a project and
  * rolls child state up into parents (Azure Boards rules cannot write
  * to a parent work item, so this closes that gap). Service-connection methods
  * (listServiceConnections, getServiceConnection) read the
  * service-endpoint inventory; variable-group methods
  * (listVariableGroups, getVariableGroup) read pipeline variable
  * groups; pull-request methods (listPullRequests, getPullRequest)
- * read PRs across a project or one repository; listAgentPools reads
+ * read PRs across a project or one repository and createPullRequests opens them with completion options set; listAgentPools reads
  * the organization-level agent pools. Access methods cover the way
  * Azure DevOps actually grants default project membership: group
  * rules. listSecurityGroups reads the group inventory at project or
@@ -351,7 +444,7 @@ async function adoRest(
  */
 export const model = {
   type: "@dougschaefer/azure-devops",
-  version: "2026.08.05.1",
+  version: "2026.09.15.1",
   globalArguments: DevOpsGlobalArgsSchema,
   resources: {
     project: {
@@ -388,6 +481,33 @@ export const model = {
       description:
         "Result of a parent-state rollup sweep: the computed state changes and whether they were applied",
       schema: RollupSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    workItemSnapshot: {
+      description:
+        "Every work item in a project (or a WIQL subset) with type, title, state, parent, creator and assignee, captured as ONE dataset so a reader gets the whole board in a single read",
+      schema: WorkItemSnapshotSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    projectMembers: {
+      description:
+        "Everyone who holds a role in a project through one security group, nested groups expanded",
+      schema: ProjectMembersSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    groupMembership: {
+      description: "One person's membership in one project security group",
+      schema: GroupMembershipSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    workItemPlan: {
+      description:
+        "Result of applying a work-item plan: what was created, moved, found already present, or refused by the authorship guard",
+      schema: WorkItemPlanSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -815,11 +935,7 @@ export const model = {
       execute: async (args, context) => {
         const g = context.globalArgs;
         const wi = await az(
-          devopsArgs(
-            ["boards", "work-item", "show", "--id", String(args.id)],
-            g,
-            args.project,
-          ),
+          orgArgs(["boards", "work-item", "show", "--id", String(args.id)], g),
           undefined,
         );
         const handle = await context.writeResource(
@@ -911,10 +1027,9 @@ export const model = {
           cmdArgs.push("--fields", `${key}=${value}`);
         }
 
-        const wi = await az(
-          devopsArgs(cmdArgs, g, args.project),
-          undefined,
-        );
+        // `az boards work-item update` addresses the item globally by --id and
+        // rejects --project outright, so pass only --org (same as the rollup).
+        const wi = await az(orgArgs(cmdArgs, g), undefined);
 
         context.logger.info("Updated work item {id}", { id: args.id });
 
@@ -1374,6 +1489,110 @@ export const model = {
           pr,
         );
         return { dataHandles: [handle] };
+      },
+    },
+
+    createPullRequests: {
+      description:
+        "Open one or more pull requests in one execution. Each entry names a source and target branch, a title and a description; completion options (merge strategy, delete the source branch on completion) are set at creation so the reviewer's Complete button already carries them. Idempotent: when an active pull request already exists for the same source and target it is returned instead of a duplicate being opened. Goes through the REST API rather than `az repos pr create`, whose repeated --description flags keep only the last value.",
+      arguments: z.object({
+        project: z.string().optional().describe(
+          "Project name (overrides global)",
+        ),
+        repository: z.string().describe("Repository name or id"),
+        pullRequests: z
+          .array(
+            z.object({
+              sourceBranch: z.string().describe(
+                "Source branch, with or without refs/heads/",
+              ),
+              targetBranch: z.string().optional().describe(
+                "Target branch (default main)",
+              ),
+              title: z.string(),
+              description: z.string().optional().describe(
+                "Markdown description (Azure DevOps caps it at 4000 characters)",
+              ),
+              isDraft: z.boolean().optional(),
+            }),
+          )
+          .min(1),
+        deleteSourceBranch: z.boolean().optional().describe(
+          "Delete the source branch when the pull request completes (default true)",
+        ),
+        mergeStrategy: z
+          .enum(["noFastForward", "squash", "rebase", "rebaseMerge"])
+          .optional()
+          .describe("Merge strategy applied on completion (default squash)"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const proj = args.project || g.project;
+        if (!proj) {
+          throw new Error(
+            "createPullRequests requires a project (set globalArgs.project or pass project)",
+          );
+        }
+        const orgUrl = g.organization.replace(/\/+$/, "");
+        const base = `${orgUrl}/${
+          encodeURIComponent(proj)
+        }/_apis/git/repositories/${
+          encodeURIComponent(args.repository)
+        }/pullrequests`;
+        const ref = (b: string) =>
+          b.startsWith("refs/") ? b : `refs/heads/${b}`;
+        const completionOptions = {
+          deleteSourceBranch: args.deleteSourceBranch ?? true,
+          mergeStrategy: args.mergeStrategy ?? "squash",
+        };
+
+        const handles = [];
+        for (const want of args.pullRequests) {
+          const source = ref(want.sourceBranch);
+          const target = ref(want.targetBranch ?? "main");
+          const existing = (await adoRest(
+            "GET",
+            `${base}?searchCriteria.status=active&searchCriteria.sourceRefName=${
+              encodeURIComponent(source)
+            }&searchCriteria.targetRefName=${
+              encodeURIComponent(target)
+            }&api-version=7.1`,
+          )) as { value?: Array<Record<string, unknown>> };
+          let pr = existing?.value?.[0];
+          if (pr) {
+            context.logger.info(
+              "Pull request {id} already open for {source} -> {target}",
+              { id: pr.pullRequestId, source, target },
+            );
+          } else {
+            const created = (await adoRest("POST", `${base}?api-version=7.1`, {
+              sourceRefName: source,
+              targetRefName: target,
+              title: want.title,
+              description: want.description ?? "",
+              isDraft: want.isDraft ?? false,
+            })) as Record<string, unknown>;
+            // Completion options on the create body are not reliably kept, so
+            // set them with an explicit update once the pull request exists.
+            pr = (await adoRest(
+              "PATCH",
+              `${base}/${created.pullRequestId}?api-version=7.1`,
+              { completionOptions },
+            )) as Record<string, unknown>;
+            context.logger.info("Opened pull request {id}: {title}", {
+              id: pr.pullRequestId,
+              title: want.title,
+            });
+          }
+          handles.push(
+            await context.writeResource(
+              "pullRequest",
+              sanitizeInstanceName(String(pr.pullRequestId)),
+              pr,
+            ),
+          );
+        }
+        return { dataHandles: handles };
       },
     },
 
@@ -2005,6 +2224,995 @@ export const model = {
             status,
             errors,
             capturedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    snapshotWorkItems: {
+      description:
+        "Capture every work item in a project — or the subset a WIQL condition selects — as ONE dataset with type, title, state, parent, creator and assignee. listWorkItems writes one dataset per item, which a script or later reader cannot collect reliably; this is the single-read view for anything that needs the whole board at once.",
+      arguments: z.object({
+        project: z.string().optional().describe(
+          "Project name (overrides global)",
+        ),
+        name: z.string().optional().describe(
+          "Dataset name to write (default: the project name)",
+        ),
+        where: z.string().optional().describe(
+          "Extra WIQL condition ANDed onto the project filter, e.g. [System.State] <> 'Done'",
+        ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const proj = args.project || g.project;
+        if (!proj) {
+          throw new Error(
+            "snapshotWorkItems requires a project (set globalArgs.project or pass project)",
+          );
+        }
+        const wiql =
+          `SELECT [System.Id],[System.WorkItemType],[System.Title],[System.State],[System.Parent],[System.CreatedBy],[System.AssignedTo],[System.Tags] ` +
+          `FROM WorkItems WHERE [System.TeamProject] = '${proj}'` +
+          (args.where ? ` AND (${args.where})` : "");
+        const rows = (await az(
+          devopsArgs(["boards", "query", "--wiql", wiql], g, args.project),
+          undefined,
+        )) as Array<Record<string, unknown>>;
+        const who = (v: unknown) => {
+          const o = (v ?? {}) as Record<string, unknown>;
+          return {
+            name: typeof o.displayName === "string" ? o.displayName : undefined,
+            email: typeof o.uniqueName === "string" ? o.uniqueName : undefined,
+          };
+        };
+        const items = rows.map((r) => {
+          const f = (r.fields ?? {}) as Record<string, unknown>;
+          const cb = who(f["System.CreatedBy"]);
+          const at = who(f["System.AssignedTo"]);
+          return {
+            id: Number(r.id),
+            type: String(f["System.WorkItemType"] ?? ""),
+            title: String(f["System.Title"] ?? ""),
+            state: String(f["System.State"] ?? ""),
+            parent: f["System.Parent"] == null
+              ? undefined
+              : Number(f["System.Parent"]),
+            createdBy: cb.name,
+            createdByEmail: cb.email,
+            assignedTo: at.name,
+            assignedToEmail: at.email,
+            tags: typeof f["System.Tags"] === "string"
+              ? String(f["System.Tags"])
+              : undefined,
+          };
+        }).sort((a, b) => a.id - b.id);
+        context.logger.info("Captured {count} work items from {project}", {
+          count: items.length,
+          project: proj,
+        });
+        const handle = await context.writeResource(
+          "workItemSnapshot",
+          sanitizeInstanceName(args.name ?? proj),
+          {
+            project: proj,
+            capturedAt: new Date().toISOString(),
+            count: items.length,
+            items,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    listProjectMembers: {
+      description:
+        "Resolve a project security group — Contributors by default — to the people in it, as ONE dataset. Azure DevOps grants project roles through groups that nest other groups (a project's team, a Microsoft Entra group), so a plain membership read stops one level down; this walks every nested group and returns the users, each tagged with the group it was found in. This is the roster to check a name against before assigning work: an assignee must hold a role in the project, and the organization directory is far wider than that.",
+      arguments: z.object({
+        project: z.string().optional().describe(
+          "Project name (overrides global)",
+        ),
+        group: z.string().optional().describe(
+          "Project group to expand, matched on the name after the backslash (default Contributors)",
+        ),
+        name: z.string().optional().describe(
+          "Dataset name to write (default: <project>-<group>)",
+        ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const proj = args.project || g.project;
+        if (!proj) {
+          throw new Error(
+            "listProjectMembers requires a project (set globalArgs.project or pass project)",
+          );
+        }
+        const groupName = (args.group ?? "Contributors").trim();
+        context.logger.info("Expanding {group} in {project}", {
+          group: groupName,
+          project: proj,
+        });
+        const listed = (await az(
+          devopsArgs(["devops", "security", "group", "list"], g, args.project),
+          undefined,
+        )) as Record<string, unknown>;
+        const groups = (listed?.graphGroups ?? listed?.value ??
+          []) as Array<Record<string, unknown>>;
+        const root = groups.find((grp) =>
+          String(grp.principalName ?? "").split("\\").pop()?.toLowerCase() ===
+            groupName.toLowerCase()
+        );
+        if (!root) {
+          throw new Error(
+            `no group named '${groupName}' in project ${proj}; groups are ${
+              groups.map((grp) => String(grp.principalName ?? "")).join(", ")
+            }`,
+          );
+        }
+
+        const members = new Map<
+          string,
+          {
+            displayName: string;
+            email: string;
+            descriptor: string;
+            via: string;
+          }
+        >();
+        const seenGroups = new Set<string>();
+        const queue: Array<{ descriptor: string; label: string }> = [{
+          descriptor: String(root.descriptor),
+          label: String(root.principalName ?? groupName),
+        }];
+        while (queue.length) {
+          const cur = queue.shift()!;
+          if (seenGroups.has(cur.descriptor)) continue;
+          seenGroups.add(cur.descriptor);
+          const raw = (await az(
+            orgArgs(
+              [
+                "devops",
+                "security",
+                "group",
+                "membership",
+                "list",
+                "--id",
+                cur.descriptor,
+              ],
+              g,
+            ),
+            undefined,
+          )) as
+            | Record<string, Record<string, unknown>>
+            | Array<Record<string, unknown>>;
+          const subjects = Array.isArray(raw) ? raw : Object.values(raw ?? {});
+          for (const sub of subjects) {
+            const kind = String(sub.subjectKind ?? "");
+            const descriptor = String(sub.descriptor ?? "");
+            if (kind === "group") {
+              queue.push({
+                descriptor,
+                label: String(
+                  sub.principalName ?? sub.displayName ?? descriptor,
+                ),
+              });
+              continue;
+            }
+            if (kind !== "user" || members.has(descriptor)) continue;
+            const email = String(sub.mailAddress ?? sub.principalName ?? "");
+            if (!email) continue;
+            members.set(descriptor, {
+              displayName: String(sub.displayName ?? email),
+              email,
+              descriptor,
+              via: cur.label,
+            });
+          }
+        }
+        const list = [...members.values()].sort((a, b) =>
+          a.displayName.localeCompare(b.displayName)
+        );
+        context.logger.info(
+          "{group} in {project}: {count} people across {groups} group(s)",
+          {
+            group: groupName,
+            project: proj,
+            count: list.length,
+            groups: seenGroups.size,
+          },
+        );
+        const handle = await context.writeResource(
+          "projectMembers",
+          sanitizeInstanceName(args.name ?? `${proj}-${groupName}`),
+          {
+            project: proj,
+            group: String(root.principalName ?? groupName),
+            capturedAt: new Date().toISOString(),
+            count: list.length,
+            members: list,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    addProjectGroupMember: {
+      description:
+        "Add a user to a project security group — Contributors by default — by email. This is how someone gains a role in one project without touching the organization-wide group rules: use it when a person already in the organization needs to be assignable work in this project. Idempotent: a user already in the group is reported, not re-added. Direct membership only; it does not look through nested groups, so a person who holds the role through the project team or a Microsoft Entra group is added a second time directly, which Azure DevOps permits and which listProjectMembers still reports once.",
+      arguments: z.object({
+        project: z.string().optional().describe(
+          "Project name (overrides global)",
+        ),
+        group: z.string().optional().describe(
+          "Project group, matched on the name after the backslash (default Contributors)",
+        ),
+        user: z.string().describe(
+          "Email (user principal name) of the person to add; they must already exist in the organization",
+        ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const proj = args.project || g.project;
+        if (!proj) {
+          throw new Error(
+            "addProjectGroupMember requires a project (set globalArgs.project or pass project)",
+          );
+        }
+        const groupName = (args.group ?? "Contributors").trim();
+        const user = args.user.trim();
+        context.logger.info("Adding {user} to {group} in {project}", {
+          user,
+          group: groupName,
+          project: proj,
+        });
+        const listed = (await az(
+          devopsArgs(["devops", "security", "group", "list"], g, args.project),
+          undefined,
+        )) as Record<string, unknown>;
+        const groups = (listed?.graphGroups ?? listed?.value ??
+          []) as Array<Record<string, unknown>>;
+        const root = groups.find((grp) =>
+          String(grp.principalName ?? "").split("\\").pop()?.toLowerCase() ===
+            groupName.toLowerCase()
+        );
+        if (!root) {
+          throw new Error(
+            `no group named '${groupName}' in project ${proj}; groups are ${
+              groups.map((grp) => String(grp.principalName ?? "")).join(", ")
+            }`,
+          );
+        }
+        const descriptor = String(root.descriptor);
+        const label = String(root.principalName ?? groupName);
+
+        const raw = (await az(
+          orgArgs(
+            [
+              "devops",
+              "security",
+              "group",
+              "membership",
+              "list",
+              "--id",
+              descriptor,
+            ],
+            g,
+          ),
+          undefined,
+        )) as
+          | Record<string, Record<string, unknown>>
+          | Array<Record<string, unknown>>;
+        const subjects = Array.isArray(raw) ? raw : Object.values(raw ?? {});
+        const already = subjects.some((sub) =>
+          sub.subjectKind === "user" &&
+          [sub.mailAddress, sub.principalName].some((v) =>
+            typeof v === "string" && v.toLowerCase() === user.toLowerCase()
+          )
+        );
+
+        let outcome: "added" | "already-member" = "already-member";
+        if (already) {
+          context.logger.info("{user} is already a direct member of {group}", {
+            user,
+            group: label,
+          });
+        } else {
+          await az(
+            orgArgs(
+              [
+                "devops",
+                "security",
+                "group",
+                "membership",
+                "add",
+                "--group-id",
+                descriptor,
+                "--member-id",
+                user,
+              ],
+              g,
+            ),
+            undefined,
+          );
+          outcome = "added";
+          context.logger.info("Added {user} to {group}", {
+            user,
+            group: label,
+          });
+        }
+        const handle = await context.writeResource(
+          "groupMembership",
+          sanitizeInstanceName(`${proj}-${groupName}-${user}`),
+          {
+            project: proj,
+            group: label,
+            user,
+            outcome,
+            appliedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    applyWorkItemPlan: {
+      description:
+        "Apply a board plan in one sweep: create work items with a parent, tags and Related links, re-parent existing items, and update existing items with a state change, a new assignee and discussion comments. Items are matched by type and title first, so a re-run never duplicates anything. Children may reference a parent created earlier in the same plan by its key. editableCreators is an authorship guard enforced in code — an existing item created by anyone else is never moved, never linked to and never given a new child; the attempt is refused and reported instead. dryRun defaults to TRUE.",
+      arguments: z.object({
+        project: z.string().optional().describe(
+          "Project name (overrides global)",
+        ),
+        dryRun: z.boolean().optional().describe(
+          "Report what would happen without writing anything (default TRUE)",
+        ),
+        editableCreators: z.array(z.string()).optional().describe(
+          "Display names or emails of the people whose existing work items this plan may touch. Omit to allow edits to any item.",
+        ),
+        items: z
+          .array(
+            z.object({
+              key: z.string().describe(
+                "Plan-local handle other entries use to reference this item",
+              ),
+              type: z.string().describe("Work item type (Epic, Issue, Task)"),
+              title: z.string(),
+              parent: z.union([z.number(), z.string()]).optional().describe(
+                "Existing work item id, or the key of an item earlier in this plan",
+              ),
+              tags: z.string().optional().describe(
+                "Semicolon-separated tags, e.g. 'azure; cloud'",
+              ),
+              assignedTo: z.string().optional().describe(
+                "Assignee email or display name for the new item",
+              ),
+              state: z.string().optional().describe(
+                "State to move the new item to after creation (e.g. Doing, Done). Azure DevOps creates items in their initial state only, so this is a second write.",
+              ),
+              description: z.string().optional(),
+              related: z.array(z.union([z.number(), z.string()])).optional()
+                .describe(
+                  "Work item ids or earlier plan keys to link as Related",
+                ),
+            }),
+          )
+          .optional(),
+        moves: z
+          .array(
+            z.object({
+              id: z.number().describe("Existing work item to re-parent"),
+              parent: z.union([z.number(), z.string()]).describe(
+                "New parent: existing id or a plan key",
+              ),
+            }),
+          )
+          .optional(),
+        updates: z
+          .array(
+            z.object({
+              id: z.number().describe("Existing work item to update"),
+              state: z.string().optional().describe(
+                "Target state. Never moves an item backwards out of Done.",
+              ),
+              comments: z.array(z.string()).optional().describe(
+                "Discussion comments to add. A comment whose text is already on the item is skipped, so re-running a plan never posts it twice.",
+              ),
+              assignedTo: z.string().optional().describe(
+                "Assignee email or display name to set; an empty string clears the assignment. Skipped when the item already has that assignee, so re-running a plan is a no-op.",
+              ),
+            }),
+          )
+          .optional(),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const proj = args.project || g.project;
+        if (!proj) {
+          throw new Error(
+            "applyWorkItemPlan requires a project (set globalArgs.project or pass project)",
+          );
+        }
+        const dryRun = args.dryRun ?? true;
+        const orgUrl = g.organization.replace(/\/+$/, "");
+        const editable = (args.editableCreators ?? []).map((c: string) =>
+          c.trim().toLowerCase()
+        );
+        const guarded = editable.length > 0;
+
+        const wiql =
+          `SELECT [System.Id],[System.WorkItemType],[System.Title],[System.State],[System.Parent],[System.CreatedBy],[System.AssignedTo] ` +
+          `FROM WorkItems WHERE [System.TeamProject] = '${proj}'`;
+        const rows = (await az(
+          devopsArgs(["boards", "query", "--wiql", wiql], g, args.project),
+          undefined,
+        )) as Array<Record<string, unknown>>;
+
+        type Existing = {
+          id: number;
+          type: string;
+          title: string;
+          state: string;
+          parent?: number;
+          creator: string[];
+          assignee?: string;
+          assigneeEmail?: string;
+        };
+        const existing = new Map<number, Existing>();
+        const byTitle = new Map<string, number>();
+        const titleKey = (type: string, title: string) =>
+          `${type.trim().toLowerCase()}|${title.trim().toLowerCase()}`;
+        for (const r of rows) {
+          const f = (r.fields ?? {}) as Record<string, unknown>;
+          const cb = (f["System.CreatedBy"] ?? {}) as Record<string, unknown>;
+          const at = (f["System.AssignedTo"] ?? {}) as Record<string, unknown>;
+          const e: Existing = {
+            id: Number(r.id),
+            type: String(f["System.WorkItemType"] ?? ""),
+            title: String(f["System.Title"] ?? ""),
+            state: String(f["System.State"] ?? ""),
+            parent: f["System.Parent"] == null
+              ? undefined
+              : Number(f["System.Parent"]),
+            creator: [cb.displayName, cb.uniqueName]
+              .filter((v) => typeof v === "string")
+              .map((v) => String(v).toLowerCase()),
+            assignee: typeof at.displayName === "string"
+              ? at.displayName
+              : undefined,
+            assigneeEmail: typeof at.uniqueName === "string"
+              ? at.uniqueName
+              : undefined,
+          };
+          existing.set(e.id, e);
+          if (!byTitle.has(titleKey(e.type, e.title))) {
+            byTitle.set(titleKey(e.type, e.title), e.id);
+          }
+        }
+
+        // An existing item is touchable only when the guard is off or its
+        // creator is on the list. Items created by this run are always ours.
+        const createdHere = new Set<number>();
+        const mayTouch = (id: number): string | undefined => {
+          if (!guarded || id < 0 || createdHere.has(id)) return undefined;
+          const e = existing.get(id);
+          if (!e) return `work item ${id} not found in ${proj}`;
+          if (e.creator.some((c) => editable.includes(c))) return undefined;
+          return `work item ${id} was created by someone outside editableCreators`;
+        };
+
+        const keyToId = new Map<string, number>();
+        let placeholder = 0;
+        const resolve = (ref: number | string): number | undefined =>
+          typeof ref === "number" ? ref : keyToId.get(ref);
+
+        const results: Array<
+          z.infer<typeof WorkItemPlanSchema>["results"][number]
+        > = [];
+
+        for (const item of args.items ?? []) {
+          const found = byTitle.get(titleKey(item.type, item.title));
+          if (found !== undefined) {
+            keyToId.set(item.key, found);
+            results.push({
+              op: "create",
+              key: item.key,
+              id: found,
+              type: item.type,
+              title: item.title,
+              parent: existing.get(found)?.parent,
+              outcome: "exists",
+            });
+            continue;
+          }
+
+          let parentId: number | undefined;
+          if (item.parent !== undefined) {
+            parentId = resolve(item.parent);
+            if (parentId === undefined) {
+              results.push({
+                op: "create",
+                key: item.key,
+                type: item.type,
+                title: item.title,
+                outcome: "failed",
+                reason:
+                  `parent '${item.parent}' is not an id or an earlier plan key`,
+              });
+              continue;
+            }
+            const blocked = mayTouch(parentId);
+            if (blocked) {
+              results.push({
+                op: "create",
+                key: item.key,
+                type: item.type,
+                title: item.title,
+                parent: parentId,
+                outcome: "refused",
+                reason: `parent: ${blocked}`,
+              });
+              continue;
+            }
+          }
+
+          const links: number[] = [];
+          const refusedLinks: string[] = [];
+          for (const ref of item.related ?? []) {
+            const target = resolve(ref);
+            const blocked = target === undefined
+              ? `'${ref}' is not an id or an earlier plan key`
+              : mayTouch(target);
+            if (blocked) refusedLinks.push(`${ref}: ${blocked}`);
+            else links.push(target!);
+          }
+
+          if (dryRun) {
+            const id = --placeholder;
+            keyToId.set(item.key, id);
+            createdHere.add(id);
+            context.logger.info(
+              "[dry-run] create {type} under {parent}: {title}",
+              {
+                type: item.type,
+                parent: parentId ?? "(top level)",
+                title: item.title,
+              },
+            );
+            results.push({
+              op: "create",
+              key: item.key,
+              type: item.type,
+              title: item.title,
+              parent: parentId,
+              outcome: "planned",
+              ...(refusedLinks.length ? { refusedLinks } : {}),
+            });
+            continue;
+          }
+
+          const patch: Array<Record<string, unknown>> = [
+            { op: "add", path: "/fields/System.Title", value: item.title },
+          ];
+          if (item.tags) {
+            patch.push({
+              op: "add",
+              path: "/fields/System.Tags",
+              value: item.tags,
+            });
+          }
+          if (item.assignedTo) {
+            patch.push({
+              op: "add",
+              path: "/fields/System.AssignedTo",
+              value: item.assignedTo,
+            });
+          }
+          if (item.description) {
+            patch.push({
+              op: "add",
+              path: "/fields/System.Description",
+              value: item.description,
+            });
+          }
+          if (parentId !== undefined) {
+            patch.push({
+              op: "add",
+              path: "/relations/-",
+              value: {
+                rel: "System.LinkTypes.Hierarchy-Reverse",
+                url: `${orgUrl}/_apis/wit/workItems/${parentId}`,
+              },
+            });
+          }
+          for (const t of links) {
+            patch.push({
+              op: "add",
+              path: "/relations/-",
+              value: {
+                rel: "System.LinkTypes.Related",
+                url: `${orgUrl}/_apis/wit/workItems/${t}`,
+              },
+            });
+          }
+
+          try {
+            const wi = (await adoRest(
+              "POST",
+              `${orgUrl}/${encodeURIComponent(proj)}/_apis/wit/workitems/$${
+                encodeURIComponent(item.type)
+              }?api-version=7.1`,
+              patch,
+              "application/json-patch+json",
+            )) as Record<string, unknown>;
+            const id = Number(wi.id);
+            keyToId.set(item.key, id);
+            createdHere.add(id);
+            if (
+              item.state && item.state !== String(
+                  ((wi.fields ?? {}) as Record<string, unknown>)[
+                    "System.State"
+                  ] ??
+                    "",
+                )
+            ) {
+              await adoRest(
+                "PATCH",
+                `${orgUrl}/_apis/wit/workitems/${id}?api-version=7.1`,
+                [{
+                  op: "add",
+                  path: "/fields/System.State",
+                  value: item.state,
+                }],
+                "application/json-patch+json",
+              );
+            }
+            byTitle.set(titleKey(item.type, item.title), id);
+            context.logger.info("Created {type} {id}: {title}", {
+              type: item.type,
+              id,
+              title: item.title,
+            });
+            results.push({
+              op: "create",
+              key: item.key,
+              id,
+              type: item.type,
+              title: item.title,
+              parent: parentId,
+              outcome: "created",
+              ...(refusedLinks.length ? { refusedLinks } : {}),
+            });
+          } catch (err) {
+            results.push({
+              op: "create",
+              key: item.key,
+              type: item.type,
+              title: item.title,
+              parent: parentId,
+              outcome: "failed",
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        for (const mv of args.moves ?? []) {
+          const e = existing.get(mv.id);
+          const target = resolve(mv.parent);
+          const base = {
+            op: "move" as const,
+            id: mv.id,
+            title: e?.title,
+            type: e?.type,
+          };
+          if (!e) {
+            results.push({
+              ...base,
+              outcome: "failed",
+              reason: `work item ${mv.id} not found in ${proj}`,
+            });
+            continue;
+          }
+          if (target === undefined) {
+            results.push({
+              ...base,
+              outcome: "failed",
+              reason:
+                `parent '${mv.parent}' is not an id or an earlier plan key`,
+            });
+            continue;
+          }
+          const blocked = mayTouch(mv.id) ?? mayTouch(target) ??
+            (e.parent !== undefined ? mayTouch(e.parent) : undefined);
+          if (blocked) {
+            results.push({
+              ...base,
+              parent: target,
+              outcome: "refused",
+              reason: blocked,
+            });
+            continue;
+          }
+          if (e.parent === target) {
+            results.push({ ...base, parent: target, outcome: "unchanged" });
+            continue;
+          }
+          if (dryRun || target < 0) {
+            context.logger.info(
+              "[dry-run] move {id} from {from} to {to}: {title}",
+              {
+                id: mv.id,
+                from: e.parent ?? "(top level)",
+                to: target,
+                title: e.title,
+              },
+            );
+            results.push({ ...base, parent: target, outcome: "planned" });
+            continue;
+          }
+          try {
+            const cur = (await adoRest(
+              "GET",
+              `${orgUrl}/_apis/wit/workitems/${mv.id}?$expand=relations&api-version=7.1`,
+            )) as Record<string, unknown>;
+            const rels = (cur.relations ?? []) as Array<
+              Record<string, unknown>
+            >;
+            const patch: Array<Record<string, unknown>> = [
+              { op: "test", path: "/rev", value: cur.rev },
+            ];
+            const idx = rels.findIndex((r) =>
+              r.rel === "System.LinkTypes.Hierarchy-Reverse"
+            );
+            if (idx >= 0) {
+              patch.push({ op: "remove", path: `/relations/${idx}` });
+            }
+            patch.push({
+              op: "add",
+              path: "/relations/-",
+              value: {
+                rel: "System.LinkTypes.Hierarchy-Reverse",
+                url: `${orgUrl}/_apis/wit/workItems/${target}`,
+              },
+            });
+            await adoRest(
+              "PATCH",
+              `${orgUrl}/_apis/wit/workitems/${mv.id}?api-version=7.1`,
+              patch,
+              "application/json-patch+json",
+            );
+            context.logger.info("Moved {id} from {from} to {to}: {title}", {
+              id: mv.id,
+              from: e.parent ?? "(top level)",
+              to: target,
+              title: e.title,
+            });
+            results.push({ ...base, parent: target, outcome: "moved" });
+          } catch (err) {
+            results.push({
+              ...base,
+              parent: target,
+              outcome: "failed",
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        // Plain text of a comment as Azure DevOps stores it (HTML), so an
+        // already-posted comment is recognised on a re-run.
+        const plain = (t: string) =>
+          t.replace(/<[^>]*>/g, " ")
+            .replace(/&nbsp;/g, " ")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'")
+            .replace(/&amp;/g, "&")
+            .replace(/\s+/g, " ")
+            .trim();
+        const escapeHtml = (t: string) =>
+          t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+        for (const up of args.updates ?? []) {
+          const e = existing.get(up.id);
+          const base = {
+            op: "update" as const,
+            id: up.id,
+            title: e?.title,
+            type: e?.type,
+          };
+          if (!e) {
+            results.push({
+              ...base,
+              outcome: "failed",
+              reason: `work item ${up.id} not found in ${proj}`,
+            });
+            continue;
+          }
+          const blocked = mayTouch(up.id);
+          if (blocked) {
+            results.push({ ...base, outcome: "refused", reason: blocked });
+            continue;
+          }
+
+          const wantState = up.state && up.state !== e.state &&
+              !(e.state === "Done" && up.state !== "Done")
+            ? up.state
+            : undefined;
+          // An assignee is compared against both the display name and the
+          // email on the item, case-insensitively; "" means unassign.
+          const askedAssignee = up.assignedTo === undefined
+            ? undefined
+            : up.assignedTo.trim();
+          const hasAssignee = e.assignee !== undefined ||
+            e.assigneeEmail !== undefined;
+          const sameAssignee = askedAssignee === undefined ||
+            (askedAssignee === "" ? !hasAssignee : [e.assignee, e.assigneeEmail]
+              .some((v) => v?.toLowerCase() === askedAssignee.toLowerCase()));
+          const wantAssignee = sameAssignee ? undefined : askedAssignee;
+          const assigneeFrom = e.assignee ?? e.assigneeEmail;
+          const wanted = (up.comments ?? []).map((c: string) => c.trim())
+            .filter((c: string) => c.length > 0);
+
+          let toPost: string[] = wanted;
+          let present = 0;
+          if (wanted.length) {
+            try {
+              const got = (await adoRest(
+                "GET",
+                `${orgUrl}/${
+                  encodeURIComponent(proj)
+                }/_apis/wit/workItems/${up.id}/comments?$top=200&api-version=7.1-preview.4`,
+              )) as { comments?: Array<{ text?: string }> };
+              const have = new Set(
+                (got?.comments ?? []).map((c) => plain(String(c.text ?? ""))),
+              );
+              toPost = wanted.filter((c: string) => !have.has(plain(c)));
+              present = wanted.length - toPost.length;
+            } catch (err) {
+              results.push({
+                ...base,
+                outcome: "failed",
+                reason: `reading existing comments: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              });
+              continue;
+            }
+          }
+
+          if (!wantState && wantAssignee === undefined && toPost.length === 0) {
+            results.push({
+              ...base,
+              outcome: "unchanged",
+              stateFrom: e.state,
+              assignedFrom: assigneeFrom,
+              commentsAlreadyPresent: present,
+            });
+            continue;
+          }
+
+          const assigneeFields = wantAssignee === undefined ? {} : {
+            assignedFrom: assigneeFrom,
+            assignedTo: wantAssignee,
+          };
+          if (dryRun) {
+            context.logger.info(
+              "[dry-run] update {id}: state {from} -> {to}, assignee {afrom} -> {ato}, {n} comment(s): {title}",
+              {
+                id: up.id,
+                from: e.state,
+                to: wantState ?? e.state,
+                afrom: assigneeFrom ?? "(unassigned)",
+                ato: wantAssignee === undefined
+                  ? assigneeFrom ?? "(unassigned)"
+                  : wantAssignee || "(unassigned)",
+                n: toPost.length,
+                title: e.title,
+              },
+            );
+            results.push({
+              ...base,
+              outcome: "planned",
+              stateFrom: e.state,
+              stateTo: wantState ?? e.state,
+              ...assigneeFields,
+              commentsAdded: toPost.length,
+              commentsAlreadyPresent: present,
+            });
+            continue;
+          }
+
+          try {
+            for (const c of toPost) {
+              await adoRest(
+                "POST",
+                `${orgUrl}/${
+                  encodeURIComponent(proj)
+                }/_apis/wit/workItems/${up.id}/comments?api-version=7.1-preview.4`,
+                { text: escapeHtml(c) },
+              );
+            }
+            const fieldPatch: Array<Record<string, unknown>> = [];
+            if (wantState) {
+              fieldPatch.push({
+                op: "add",
+                path: "/fields/System.State",
+                value: wantState,
+              });
+            }
+            if (wantAssignee !== undefined) {
+              fieldPatch.push({
+                op: "add",
+                path: "/fields/System.AssignedTo",
+                value: wantAssignee,
+              });
+            }
+            if (fieldPatch.length) {
+              await adoRest(
+                "PATCH",
+                `${orgUrl}/_apis/wit/workitems/${up.id}?api-version=7.1`,
+                fieldPatch,
+                "application/json-patch+json",
+              );
+            }
+            context.logger.info(
+              "Updated {id}: state {from} -> {to}, assignee {afrom} -> {ato}, {n} comment(s): {title}",
+              {
+                id: up.id,
+                from: e.state,
+                to: wantState ?? e.state,
+                afrom: assigneeFrom ?? "(unassigned)",
+                ato: wantAssignee === undefined
+                  ? assigneeFrom ?? "(unassigned)"
+                  : wantAssignee || "(unassigned)",
+                n: toPost.length,
+                title: e.title,
+              },
+            );
+            results.push({
+              ...base,
+              outcome: "updated",
+              stateFrom: e.state,
+              stateTo: wantState ?? e.state,
+              ...assigneeFields,
+              commentsAdded: toPost.length,
+              commentsAlreadyPresent: present,
+            });
+          } catch (err) {
+            results.push({
+              ...base,
+              outcome: "failed",
+              stateFrom: e.state,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        const tally = (o: string) =>
+          results.filter((r) => r.outcome === o).length;
+        context.logger.info(
+          "Plan against {project}: {created} created, {moved} moved, {updated} updated, {exists} already present, {planned} planned, {refused} refused, {failed} failed{suffix}",
+          {
+            project: proj,
+            created: tally("created"),
+            moved: tally("moved"),
+            updated: tally("updated"),
+            exists: tally("exists"),
+            planned: tally("planned"),
+            refused: tally("refused"),
+            failed: tally("failed"),
+            suffix: dryRun ? " (dry run)" : "",
+          },
+        );
+
+        const handle = await context.writeResource(
+          "workItemPlan",
+          sanitizeInstanceName(proj),
+          {
+            project: proj,
+            dryRun,
+            scanned: existing.size,
+            editableCreators: args.editableCreators ?? [],
+            results,
           },
         );
         return { dataHandles: [handle] };

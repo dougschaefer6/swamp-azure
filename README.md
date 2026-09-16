@@ -439,6 +439,17 @@ Flow logs are the only record of which 5-tuples actually crossed the network. NS
 | `listPullRequests` | List pull requests across a project or one repository |
 | `getPullRequest` | Get a pull request by id |
 | `listAgentPools` | List the organization's agent pools |
+| `createPullRequests` | Open one or more pull requests in one execution |
+| `listSecurityGroups` | List security groups, scoped to a project or the organization |
+| `listProjectMembers` | Resolve a project security group (Contributors by default) to the people in it, nested groups expanded, as one dataset |
+| `addProjectGroupMember` | Add a user to a project security group by email; idempotent |
+| `listGroupRules` | List the organization's group rules and the projects each one grants membership in |
+| `auditGroupRuleCoverage` | Compare every project against every group rule and report the gaps |
+| `addProjectsToGroupRules` | Add projects to one or more group rules in a single fan-out |
+| `addProjectsToUserEntitlement` | Grant one user project membership directly, outside the group rules |
+| `snapshotWorkItems` | Capture a project's work items (type, title, state, parent, creator, assignee) as one dataset |
+| `applyWorkItemPlan` | Apply a board plan in one sweep: create items under a parent, re-parent, and update state, assignee and comments; dry run by default |
+| `rollupParentStates` | Roll parent work-item state up from children in one sweep |
 
 ### azure-vwan
 

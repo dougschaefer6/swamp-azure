@@ -66,7 +66,7 @@ const SubscriptionSchema = z
  */
 export const model = {
   type: "@dougschaefer/azure-servicebus",
-  version: "2026.08.05.1",
+  version: "2026.09.15.1",
   globalArguments: AzureGlobalArgsSchema,
   resources: {
     namespace: {
